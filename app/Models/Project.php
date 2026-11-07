@@ -1,0 +1,202 @@
+<?php
+
+namespace App\Models;
+
+use App\Traits\Auditable;
+use App\Traits\ClearsGlobalSearchCache;
+use App\Traits\HasSafeStringAttribute;
+use App\Traits\ScopedByAccessGrants;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Support\Collection;
+use OpenApi\Attributes as OA;
+
+#[OA\Schema(
+    description: 'Project model',
+    type: 'object',
+    properties: [
+        'id' => ['type' => 'integer'],
+        'uuid' => ['type' => 'string'],
+        'name' => ['type' => 'string'],
+        'description' => ['type' => 'string'],
+    ]
+)]
+class Project extends BaseModel
+{
+    use Auditable, HasFactory;
+    use ClearsGlobalSearchCache, ScopedByAccessGrants;
+    use HasSafeStringAttribute;
+
+    protected $fillable = [
+        'name',
+        'description',
+        'team_id',
+        'uuid',
+    ];
+
+    protected array $auditExclude = ['canvas_position'];
+
+    protected function casts(): array
+    {
+        return [
+            'canvas_position' => 'array',
+        ];
+    }
+
+    /**
+     * Get query builder for projects owned by current team.
+     * If you need all projects without further query chaining, use ownedByCurrentTeamCached() instead.
+     */
+    public static function ownedByCurrentTeam()
+    {
+        return Project::whereTeamId(currentTeam()->id)->orderByRaw('LOWER(name)');
+    }
+
+    /**
+     * Get all projects owned by current team (cached for request duration).
+     */
+    public static function ownedByCurrentTeamCached()
+    {
+        return once(function () {
+            return Project::ownedByCurrentTeam()->get();
+        });
+    }
+
+    protected static function booted()
+    {
+        static::created(function ($project) {
+            ProjectSetting::create([
+                'project_id' => $project->id,
+            ]);
+            Environment::create([
+                'name' => 'production',
+                'project_id' => $project->id,
+                'uuid' => new_public_id(),
+            ]);
+        });
+        static::deleting(function ($project) {
+            foreach ($project->environments()->get() as $environment) {
+                $environment->delete();
+            }
+            $project->settings()->delete();
+            $shared_variables = $project->environment_variables();
+            foreach ($shared_variables as $shared_variable) {
+                $shared_variable->delete();
+            }
+        });
+    }
+
+    public function environment_variables()
+    {
+        return $this->hasMany(SharedEnvironmentVariable::class)->where('type', 'project');
+    }
+
+    public function environments()
+    {
+        return $this->hasMany(Environment::class);
+    }
+
+    public function settings()
+    {
+        return $this->hasOne(ProjectSetting::class);
+    }
+
+    public function team()
+    {
+        return $this->belongsTo(Team::class);
+    }
+
+    public function services()
+    {
+        return $this->hasManyThrough(Service::class, Environment::class);
+    }
+
+    public function applications()
+    {
+        return $this->hasManyThrough(Application::class, Environment::class);
+    }
+
+    public function postgresqls()
+    {
+        return $this->hasManyThrough(StandalonePostgresql::class, Environment::class);
+    }
+
+    public function redis()
+    {
+        return $this->hasManyThrough(StandaloneRedis::class, Environment::class);
+    }
+
+    public function keydbs()
+    {
+        return $this->hasManyThrough(StandaloneKeydb::class, Environment::class);
+    }
+
+    public function dragonflies()
+    {
+        return $this->hasManyThrough(StandaloneDragonfly::class, Environment::class);
+    }
+
+    public function clickhouses()
+    {
+        return $this->hasManyThrough(StandaloneClickhouse::class, Environment::class);
+    }
+
+    public function sqlites()
+    {
+        return $this->hasManyThrough(StandaloneSqlite::class, Environment::class);
+    }
+
+    public function mongodbs()
+    {
+        return $this->hasManyThrough(StandaloneMongodb::class, Environment::class);
+    }
+
+    public function mysqls()
+    {
+        return $this->hasManyThrough(StandaloneMysql::class, Environment::class);
+    }
+
+    public function mariadbs()
+    {
+        return $this->hasManyThrough(StandaloneMariadb::class, Environment::class);
+    }
+
+    public function isEmpty()
+    {
+        return $this->applications()->count() == 0 &&
+            $this->redis()->count() == 0 &&
+            $this->postgresqls()->count() == 0 &&
+            $this->mysqls()->count() == 0 &&
+            $this->keydbs()->count() == 0 &&
+            $this->dragonflies()->count() == 0 &&
+            $this->clickhouses()->count() == 0 &&
+            $this->mariadbs()->count() == 0 &&
+            $this->mongodbs()->count() == 0 &&
+            $this->sqlites()->count() == 0 &&
+            $this->services()->count() == 0;
+    }
+
+    public function databases(array $with = []): Collection
+    {
+        return $this->postgresqls()->with($with)->get()
+            ->concat($this->redis()->with($with)->get())
+            ->concat($this->mongodbs()->with($with)->get())
+            ->concat($this->mysqls()->with($with)->get())
+            ->concat($this->mariadbs()->with($with)->get())
+            ->concat($this->keydbs()->with($with)->get())
+            ->concat($this->dragonflies()->with($with)->get())
+            ->concat($this->clickhouses()->with($with)->get())
+            ->concat($this->sqlites()->with($with)->get());
+    }
+
+    public function navigateTo()
+    {
+        if ($this->environments->count() === 1) {
+            return route('project.resource.index', [
+                'project_uuid' => $this->uuid,
+                'environment_uuid' => $this->environments->first()->uuid,
+            ]);
+        }
+
+        return route('project.show', ['project_uuid' => $this->uuid]);
+    }
+}

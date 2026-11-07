@@ -1,0 +1,264 @@
+<?php
+
+namespace App\Notifications\Application;
+
+use App\Models\Application;
+use App\Models\ApplicationDeploymentQueue;
+use App\Models\ApplicationPreview;
+use App\Notifications\CustomEmailNotification;
+use App\Notifications\Dto\DiscordMessage;
+use App\Notifications\Dto\PushoverMessage;
+use App\Notifications\Dto\SlackMessage;
+use App\Notifications\ImageScan\NotificationText;
+use App\Traits\IncludesDeploymentCommitDetails;
+use Illuminate\Notifications\Messages\MailMessage;
+
+class DeploymentFailed extends CustomEmailNotification
+{
+    use IncludesDeploymentCommitDetails;
+
+    public Application $application;
+
+    public ?ApplicationPreview $preview = null;
+
+    public string $deployment_uuid;
+
+    public string $application_name;
+
+    public string $project_uuid;
+
+    public string $environment_uuid;
+
+    public string $environment_name;
+
+    public ?string $deployment_url = null;
+
+    public ?string $fqdn = null;
+
+    /** The gate headline ("Deploy blocked: this image has 2 security problems that attackers are using") when the image scan gate stopped the deployment, for email. Never IDs. */
+    public ?string $blockedTitle = null;
+
+    /** The same headline without counts, for chat and webhook channels. */
+    public ?string $blockedChatTitle = null;
+
+    public function __construct(Application $application, string $deployment_uuid, ?ApplicationPreview $preview = null, ?ApplicationDeploymentQueue $deployment = null)
+    {
+        $this->onQueue('high');
+        $this->application = $application;
+        $this->deployment_uuid = $deployment_uuid;
+        $this->preview = $preview;
+        $this->application_name = data_get($application, 'name');
+        $this->project_uuid = data_get($application, 'environment.project.uuid');
+        $this->environment_uuid = data_get($application, 'environment.uuid');
+        $this->environment_name = data_get($application, 'environment.name');
+        $this->fqdn = data_get($application, 'fqdn');
+        if (str($this->fqdn)->explode(',')->count() > 1) {
+            $this->fqdn = str($this->fqdn)->explode(',')->first();
+        }
+        $this->deployment_url = base_url()."/project/{$this->project_uuid}/environment/{$this->environment_uuid}/application/{$this->application->uuid}/deployment/{$this->deployment_uuid}";
+        $this->resolveDeploymentCommitDetails($application, $deployment, $preview);
+        $gate = $deployment?->deployment_uuid === $deployment_uuid
+            ? $deployment->scan_gate_result
+            : ApplicationDeploymentQueue::query()->where('deployment_uuid', $deployment_uuid)->value('scan_gate_result');
+        if (is_array($gate) && ($gate['blocked'] ?? false)) {
+            $this->blockedTitle = self::blockedTitle((string) ($gate['headline'] ?? ''));
+            // A result stored before the plain headline existed may count problems: chat gets the generic title then.
+            $this->blockedChatTitle = isset($gate['headline_plain'])
+                ? self::blockedTitle((string) $gate['headline_plain'])
+                : (preg_match('/\d/', (string) ($gate['headline'] ?? '')) === 1 ? self::blockedTitle('') : $this->blockedTitle);
+        }
+    }
+
+    private static function blockedTitle(string $headline): string
+    {
+        $headline = rtrim(NotificationText::plain(mb_substr($headline, 0, 300)), '.');
+        if ($headline === '') {
+            return 'Deploy blocked by the image scan';
+        }
+
+        return str_starts_with($headline, 'Deploy blocked') ? $headline : "Deploy blocked: {$headline}";
+    }
+
+    public function via(object $notifiable): array
+    {
+        return $notifiable->getEnabledChannels('deployment_failure');
+    }
+
+    public function toMail(?object $notifiable = null): MailMessage
+    {
+        $mail = new MailMessage;
+        $pull_request_id = data_get($this->preview, 'pull_request_id', 0);
+        $fqdn = $this->fqdn;
+        if ($this->blockedTitle !== null) {
+            $mail->subject('Coolify: '.$this->blockedTitle.' ('.$this->application_name.').');
+        } elseif ($pull_request_id === 0) {
+            $mail->subject('Coolify: Deployment failed of '.$this->application_name.'.');
+        } else {
+            $fqdn = $this->preview->fqdn;
+            $mail->subject('Coolify: Deployment failed of pull request #'.$this->preview->pull_request_id.' of '.$this->application_name.'.');
+        }
+        $mail->view('emails.application-deployment-failed', [
+            'commit' => $this->deploymentCommitDetailsForMail($notifiable),
+            'name' => $this->application_name,
+            'fqdn' => $fqdn,
+            'deployment_url' => $this->deployment_url,
+            'pull_request_id' => data_get($this->preview, 'pull_request_id', 0),
+            'blocked' => $this->blockedTitle === null ? null : NotificationText::mailMarkdown($this->blockedTitle),
+        ]);
+
+        return $mail;
+    }
+
+    public function toDiscord(): DiscordMessage
+    {
+        if ($this->preview) {
+            $message = new DiscordMessage(
+                title: $this->blockedChatTitle ?? ':cross_mark: Deployment failed',
+                description: 'Pull request: '.$this->preview->pull_request_id,
+                color: DiscordMessage::errorColor(),
+                isCritical: true,
+            );
+
+            $message->addField('Project', data_get($this->application, 'environment.project.name'), true);
+            $message->addField('Environment', $this->environment_name, true);
+            $message->addField('Name', $this->application_name, true);
+
+            $message->addField('Deployment Logs', '[Link]('.$this->deployment_url.')');
+            if ($this->fqdn) {
+                $message->addField('Domain', $this->fqdn, true);
+            }
+        } else {
+            if ($this->fqdn) {
+                $description = '[Open application]('.$this->fqdn.')';
+            } else {
+                $description = '';
+            }
+            $message = new DiscordMessage(
+                title: $this->blockedChatTitle ?? ':cross_mark: Deployment failed',
+                description: $description,
+                color: DiscordMessage::errorColor(),
+                isCritical: true,
+            );
+
+            $message->addField('Project', data_get($this->application, 'environment.project.name'), true);
+            $message->addField('Environment', $this->environment_name, true);
+            $message->addField('Name', $this->application_name, true);
+
+            $message->addField('Deployment Logs', '[Link]('.$this->deployment_url.')');
+        }
+
+        return $message;
+    }
+
+    public function toTelegram(): array
+    {
+        if ($this->blockedChatTitle !== null) {
+            $message = 'Coolify: '.$this->blockedChatTitle.' ('.$this->application_name.'): ';
+        } elseif ($this->preview) {
+            $message = 'Coolify: Pull request #'.$this->preview->pull_request_id.' of '.$this->application_name.' ('.$this->preview->fqdn.') deployment failed: ';
+        } else {
+            $message = 'Coolify: Deployment failed of '.$this->application_name.' ('.$this->fqdn.'): ';
+        }
+        $buttons[] = [
+            'text' => 'Deployment logs',
+            'url' => $this->deployment_url,
+        ];
+
+        return [
+            'message' => $message,
+            'buttons' => [
+                ...$buttons,
+            ],
+        ];
+    }
+
+    public function toPushover(): PushoverMessage
+    {
+        if ($this->blockedChatTitle !== null) {
+            $title = $this->blockedChatTitle;
+            $message = 'The image scan blocked the deployment of '.NotificationText::html($this->application_name).'.';
+        } elseif ($this->preview) {
+            $title = "Pull request #{$this->preview->pull_request_id} deployment failed";
+            $message = "Pull request deployment failed for {$this->application_name}";
+        } else {
+            $title = 'Deployment failed';
+            $message = "Deployment failed for {$this->application_name}";
+        }
+
+        $buttons[] = [
+            'text' => 'Deployment logs',
+            'url' => $this->deployment_url,
+        ];
+
+        return new PushoverMessage(
+            title: $title,
+            level: 'error',
+            message: $message,
+            buttons: [
+                ...$buttons,
+            ],
+        );
+    }
+
+    public function toSlack(): SlackMessage
+    {
+        if ($this->preview) {
+            $title = "Pull request #{$this->preview->pull_request_id} deployment failed";
+            $description = "Pull request deployment failed for {$this->application_name}";
+            if ($this->preview->fqdn) {
+                $description .= "\nPreview URL: {$this->preview->fqdn}";
+            }
+        } else {
+            $title = 'Deployment failed';
+            $description = "Deployment failed for {$this->application_name}";
+            if ($this->fqdn) {
+                $description .= "\nApplication URL: {$this->fqdn}";
+            }
+        }
+
+        if ($this->blockedChatTitle !== null) {
+            $title = $this->blockedChatTitle;
+            $description = 'The image scan blocked the deployment of '.NotificationText::slack($this->application_name).'.';
+        }
+
+        $description .= "\n\n*Project:* ".data_get($this->application, 'environment.project.name');
+        $description .= "\n*Environment:* {$this->environment_name}";
+        $description .= "\n*<{$this->deployment_url}|Deployment Logs>*";
+
+        return new SlackMessage(
+            title: $title,
+            description: $description,
+            color: SlackMessage::errorColor()
+        );
+    }
+
+    public function toWebhook(): array
+    {
+        $data = [
+            'success' => false,
+            'message' => $this->blockedChatTitle ?? 'Deployment failed',
+            'event' => 'deployment_failed',
+            'application_name' => $this->application_name,
+            'application_uuid' => $this->application->uuid,
+            'deployment_uuid' => $this->deployment_uuid,
+            'deployment_url' => $this->deployment_url,
+            'project' => data_get($this->application, 'environment.project.name'),
+            'environment' => $this->environment_name,
+        ];
+
+        if ($this->preview) {
+            $data['pull_request_id'] = $this->preview->pull_request_id;
+            $data['preview_fqdn'] = $this->preview->fqdn;
+        }
+
+        if ($this->fqdn) {
+            $data['fqdn'] = $this->fqdn;
+        }
+
+        if ($this->blockedChatTitle !== null) {
+            $data['blocked'] = true;
+        }
+
+        return $data;
+    }
+}

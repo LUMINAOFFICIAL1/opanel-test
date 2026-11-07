@@ -1,0 +1,199 @@
+<?php
+
+namespace App\Actions\Database;
+
+use App\Actions\Shared\EnsureContentFilesOnServer;
+use App\Models\StandaloneClickhouse;
+use App\Traits\ExecutesDatabaseStartCommands;
+use Lorisleiva\Actions\Concerns\AsAction;
+use Spatie\Activitylog\Models\Activity;
+use Symfony\Component\Yaml\Yaml;
+
+class StartClickhouse
+{
+    use AsAction, ExecutesDatabaseStartCommands;
+
+    public StandaloneClickhouse $database;
+
+    public array $commands = [];
+
+    public string $configuration_dir;
+
+    private string $resolvedClickhouseUser;
+
+    private string $resolvedClickhousePassword;
+
+    public function handle(StandaloneClickhouse $database, ?Activity $activity = null)
+    {
+        $this->database = $database;
+
+        $container_name = $this->database->uuid;
+        $this->configuration_dir = database_configuration_dir().'/'.$container_name;
+
+        $this->commands = [
+            "echo 'Starting database.'",
+            "mkdir -p $this->configuration_dir",
+        ];
+
+        $persistent_storages = $this->generate_local_persistent_volumes();
+        $persistent_file_volumes = $this->database->fileStorages()->get();
+        array_push($this->commands, ...EnsureContentFilesOnServer::echoCommands($persistent_file_volumes, $this->database->destination->server));
+        $volume_names = $this->generate_local_persistent_volumes_only_volume_names();
+        $environment_variables = $this->generate_environment_variables();
+
+        $docker_compose = [
+            'services' => [
+                $container_name => [
+                    'image' => $this->database->image,
+                    'container_name' => $container_name,
+                    'environment' => $environment_variables,
+                    'restart' => RESTART_MODE,
+                    'networks' => [
+                        $this->database->destination->network,
+                    ],
+                    'ulimits' => [
+                        'nofile' => [
+                            'soft' => 262144,
+                            'hard' => 262144,
+                        ],
+                    ],
+                    'labels' => defaultDatabaseLabels($this->database)->toArray(),
+                    'healthcheck' => $this->database->healthCheckConfiguration([
+                        'CMD', 'clickhouse-client', '--user', $this->resolvedClickhouseUser, '--password', $this->resolvedClickhousePassword, '--query', 'SELECT 1',
+                    ]),
+                    'mem_limit' => $this->database->limits_memory,
+                    'memswap_limit' => $this->database->limits_memory_swap,
+                    'mem_swappiness' => $this->database->limits_memory_swappiness,
+                    'mem_reservation' => $this->database->limits_memory_reservation,
+                    'cpus' => (float) $this->database->limits_cpus,
+                    'cpu_shares' => $this->database->limits_cpu_shares,
+                ],
+            ],
+            'networks' => [
+                $this->database->destination->network => [
+                    'external' => true,
+                    'name' => $this->database->destination->network,
+                    'attachable' => true,
+                ],
+            ],
+        ];
+        if (! is_null($this->database->limits_cpuset)) {
+            data_set($docker_compose, "services.{$container_name}.cpuset", $this->database->limits_cpuset);
+        }
+        if ($this->database->destination->server->isLogDrainEnabled() && $this->database->isLogDrainEnabled()) {
+            $docker_compose['services'][$container_name]['logging'] = generate_log_drain_configuration($this->database->destination->server);
+        }
+        if (count($this->database->ports_mappings_array) > 0) {
+            $docker_compose['services'][$container_name]['ports'] = $this->database->ports_mappings_array;
+        }
+
+        $docker_compose['services'][$container_name]['volumes'] ??= [];
+
+        if (count($persistent_storages) > 0) {
+            $docker_compose['services'][$container_name]['volumes'] = array_merge(
+                $docker_compose['services'][$container_name]['volumes'],
+                $persistent_storages
+            );
+        }
+
+        if (count($persistent_file_volumes) > 0) {
+            $docker_compose['services'][$container_name]['volumes'] = array_merge(
+                $docker_compose['services'][$container_name]['volumes'],
+                $persistent_file_volumes->map(function ($item) {
+                    return "$item->fs_path:$item->mount_path";
+                })->toArray()
+            );
+        }
+        if (count($volume_names) > 0) {
+            $docker_compose['volumes'] = $volume_names;
+        }
+
+        // Add custom docker run options
+        $docker_run_options = convertDockerRunToCompose($this->database->custom_docker_run_options);
+        $docker_compose = generateCustomDockerRunOptionsForDatabases($docker_run_options, $docker_compose, $container_name, $this->database->destination->network);
+
+        if (! $this->database->isHealthcheckEnabled()) {
+            unset($docker_compose['services'][$container_name]['healthcheck']);
+        }
+        $docker_compose = Yaml::dump($docker_compose, 10);
+        $docker_compose_base64 = base64_encode($docker_compose);
+        $this->commands[] = "echo '{$docker_compose_base64}' | base64 -d | tee $this->configuration_dir/docker-compose.yml > /dev/null";
+        $readme = generate_readme_file($this->database->name, now());
+        $this->commands[] = "echo '{$readme}' | tee $this->configuration_dir/README.md > /dev/null";
+        $this->commands[] = 'echo '.escapeshellarg("Pulling {$database->image} image.");
+        array_push($this->commands, ...$this->pullImageCommands("{$this->configuration_dir}/docker-compose.yml"));
+        $this->commands[] = dockerStopCommand(10, $container_name, $this->database->destination->server).' 2>/dev/null || true';
+        $this->commands[] = "docker rm -f $container_name 2>/dev/null || true";
+        $this->commands[] = "docker compose -f $this->configuration_dir/docker-compose.yml up -d";
+        $this->commands[] = "echo 'Database started.'";
+
+        return $this->executeDatabaseStartCommands($this->commands, $database, $activity);
+    }
+
+    private function generate_local_persistent_volumes()
+    {
+        $local_persistent_volumes = [];
+        foreach ($this->database->persistentStorages as $persistentStorage) {
+            if ($persistentStorage->host_path !== '' && $persistentStorage->host_path !== null) {
+                $local_persistent_volumes[] = $persistentStorage->host_path.':'.$persistentStorage->mount_path;
+            } else {
+                $volume_name = $persistentStorage->name;
+                $local_persistent_volumes[] = $volume_name.':'.$persistentStorage->mount_path;
+            }
+        }
+
+        return $local_persistent_volumes;
+    }
+
+    private function generate_local_persistent_volumes_only_volume_names()
+    {
+        $local_persistent_volumes_names = [];
+        foreach ($this->database->persistentStorages as $persistentStorage) {
+            if ($persistentStorage->host_path) {
+                continue;
+            }
+            $name = $persistentStorage->name;
+            $local_persistent_volumes_names[$name] = [
+                'name' => $name,
+                'external' => false,
+            ];
+        }
+
+        return $local_persistent_volumes_names;
+    }
+
+    private function generate_environment_variables()
+    {
+        $environment_variables = collect();
+        $this->resolvedClickhouseUser = (string) $this->database->clickhouse_admin_user;
+        $this->resolvedClickhousePassword = (string) $this->database->clickhouse_admin_password;
+        foreach ($this->database->runtime_environment_variables as $env) {
+            $rawValue = (string) $this->database->resolveSecretManagerEnvironmentVariableValue($env);
+            $resolvedValue = (string) $this->database->formatEnvironmentVariableValue($env, $rawValue);
+            // Credentials below are placed directly in the compose file (healthcheck, command).
+            $composeFileValue = $this->database->formatComposeFileValue($env, $rawValue);
+            $environment_variables->push($env->key.'='.$resolvedValue);
+            if ($env->key === 'CLICKHOUSE_USER') {
+                $this->resolvedClickhouseUser = $composeFileValue;
+            } elseif ($env->key === 'CLICKHOUSE_PASSWORD') {
+                $this->resolvedClickhousePassword = $composeFileValue;
+            }
+        }
+
+        if (! $this->hasEnvironmentVariable($environment_variables, 'CLICKHOUSE_USER')) {
+            $environment_variables->push("CLICKHOUSE_USER={$this->database->clickhouse_admin_user}");
+        }
+
+        if (! $this->hasEnvironmentVariable($environment_variables, 'CLICKHOUSE_PASSWORD')) {
+            $environment_variables->push("CLICKHOUSE_PASSWORD={$this->database->clickhouse_admin_password}");
+        }
+
+        if (! $this->hasEnvironmentVariable($environment_variables, 'CLICKHOUSE_DB')) {
+            $environment_variables->push("CLICKHOUSE_DB={$this->database->clickhouse_db}");
+        }
+
+        $this->addCoolifyEnvironmentVariables($environment_variables);
+
+        return $environment_variables->all();
+    }
+}

@@ -1,0 +1,448 @@
+<?php
+
+namespace App\Models;
+
+use App\Traits\Auditable;
+use App\Traits\ClearsGlobalSearchCache;
+use App\Traits\HasDatabaseHealthCheck;
+use App\Traits\HasImageScans;
+use App\Traits\HasLogRedactionSetting;
+use App\Traits\HasMetrics;
+use App\Traits\HasSafeStringAttribute;
+use App\Traits\HasSecretManager;
+use App\Traits\HasStars;
+use App\Traits\ScopedByAccessGrants;
+use Illuminate\Database\Eloquent\Casts\Attribute;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\SoftDeletes;
+use Throwable;
+
+class StandaloneClickhouse extends BaseModel
+{
+    use Auditable, ClearsGlobalSearchCache, HasDatabaseHealthCheck, HasFactory, HasImageScans, HasLogRedactionSetting, HasMetrics, HasSafeStringAttribute, HasSecretManager, HasStars, ScopedByAccessGrants, SoftDeletes;
+
+    protected array $auditExclude = ['last_online_at'];
+
+    public const DATA_DIRECTORY = '/var/lib/clickhouse';
+
+    protected $fillable = [
+        'uuid',
+        'name',
+        'description',
+        'clickhouse_admin_user',
+        'clickhouse_admin_password',
+        'is_log_drain_enabled',
+        'is_include_timestamps',
+        'status',
+        'image',
+        'is_public',
+        'public_port',
+        'ports_mappings',
+        'limits_memory',
+        'limits_memory_swap',
+        'limits_memory_swappiness',
+        'limits_memory_reservation',
+        'limits_cpus',
+        'limits_cpuset',
+        'limits_cpu_shares',
+        'started_at',
+        'restart_count',
+        'last_restart_at',
+        'last_restart_type',
+        'last_online_at',
+        'public_port_timeout',
+        'custom_docker_run_options',
+        'clickhouse_db',
+        'destination_type',
+        'destination_id',
+        'environment_id',
+        'health_check_enabled',
+        'health_check_interval',
+        'health_check_timeout',
+        'health_check_retries',
+        'health_check_start_period',
+    ];
+
+    protected $appends = ['internal_db_url', 'external_db_url', 'database_type', 'server_status'];
+
+    /**
+     * Free-form configuration that can embed credentials. Only users who can
+     * update the database and `read:sensitive` tokens may read it.
+     */
+    public const CONFIGURATION_ATTRIBUTES = [
+        'custom_docker_run_options',
+    ];
+
+    /**
+     * Sensitive fields hidden by default in serialized output (toArray/toJson).
+     * API controllers should call makeVisible([...]) for callers with the
+     * `read:sensitive` or `root` token ability.
+     */
+    protected $hidden = [
+        'clickhouse_admin_password',
+        ...self::CONFIGURATION_ATTRIBUTES,
+        'internal_db_url',
+        'external_db_url',
+    ];
+
+    protected $casts = [
+        'include_coolify_default_variables' => 'boolean',
+        'health_check_enabled' => 'boolean',
+        'health_check_interval' => 'integer',
+        'health_check_timeout' => 'integer',
+        'health_check_retries' => 'integer',
+        'health_check_start_period' => 'integer',
+        'clickhouse_admin_password' => 'encrypted',
+        'public_port_timeout' => 'integer',
+        'restart_count' => 'integer',
+        'last_restart_at' => 'datetime',
+        'last_restart_type' => 'string',
+    ];
+
+    protected static function booted()
+    {
+        static::created(function ($database) {
+            LocalPersistentVolume::create([
+                'name' => 'clickhouse-data-'.$database->uuid,
+                'mount_path' => '/var/lib/clickhouse',
+                'host_path' => null,
+                'resource_id' => $database->id,
+                'resource_type' => $database->getMorphClass(),
+            ]);
+        });
+        static::forceDeleting(function ($database) {
+            $database->persistentStorages()->delete();
+            $database->scheduledBackups()->delete();
+            $database->environment_variables()->delete();
+            $database->tags()->detach();
+        });
+        static::saving(function ($database) {
+            if ($database->isDirty('status')) {
+                $database->last_online_at = now();
+            }
+        });
+    }
+
+    /**
+     * Get query builder for ClickHouse databases owned by current team.
+     * If you need all databases without further query chaining, use ownedByCurrentTeamCached() instead.
+     */
+    public static function ownedByCurrentTeam()
+    {
+        return StandaloneClickhouse::whereRelation('environment.project.team', 'id', currentTeam()->id)->orderBy('name');
+    }
+
+    /**
+     * Get all ClickHouse databases owned by current team (cached for request duration).
+     */
+    public static function ownedByCurrentTeamCached()
+    {
+        return once(function () {
+            return StandaloneClickhouse::ownedByCurrentTeam()->get();
+        });
+    }
+
+    protected function serverStatus(): Attribute
+    {
+        return Attribute::make(
+            get: function () {
+                return $this->destination->server->isFunctional();
+            }
+        );
+    }
+
+    public function isConfigurationChanged(bool $save = false)
+    {
+        $newConfigHash = $this->image.$this->ports_mappings;
+        $newConfigHash .= $this->healthCheckConfigurationHash();
+        $newConfigHash .= json_encode($this->environment_variables()->get('value')->makeVisible('value')->sort());
+        $newConfigHash = md5($newConfigHash);
+        $oldConfigHash = data_get($this, 'config_hash');
+        if ($oldConfigHash === null) {
+            if ($save) {
+                $this->config_hash = $newConfigHash;
+                $this->save();
+            }
+
+            return true;
+        }
+        if ($oldConfigHash === $newConfigHash) {
+            return false;
+        } else {
+            if ($save) {
+                $this->config_hash = $newConfigHash;
+                $this->save();
+            }
+
+            return true;
+        }
+    }
+
+    public function isRunning()
+    {
+        return (bool) str($this->status)->contains('running');
+    }
+
+    public function isExited()
+    {
+        return (bool) str($this->status)->startsWith('exited');
+    }
+
+    public function workdir()
+    {
+        return database_configuration_dir()."/{$this->uuid}";
+    }
+
+    public function deleteConfigurations()
+    {
+        $server = data_get($this, 'destination.server');
+        $workdir = $this->workdir();
+        if (str($workdir)->endsWith($this->uuid)) {
+            instant_remote_process(['rm -rf '.$this->workdir()], $server, false);
+        }
+    }
+
+    /**
+     * Name of the unnamed Docker volume that holds this database's data, or null.
+     *
+     * Before v4.4, adding a file mount removed the data volume from the compose file, so the
+     * container keeps its data in an unnamed volume. Recreating the container leaves that volume
+     * behind and starts on the configured data volume, so the current data seems lost.
+     */
+    public function anonymousDataVolume(): ?string
+    {
+        $server = data_get($this, 'destination.server');
+        if (! $server?->isFunctional()) {
+            return null;
+        }
+
+        $format = '{{range .Mounts}}{{if eq .Destination "'.self::DATA_DIRECTORY.'"}}{{.Type}} {{.Name}}{{end}}{{end}}';
+        try {
+            $output = instant_remote_process_with_timeout([
+                'docker inspect --format '.escapeshellarg($format).' '.escapeshellarg($this->uuid).' 2>/dev/null || true',
+            ], $server, false);
+        } catch (Throwable) {
+            return null;
+        }
+
+        [$type, $name] = array_pad(explode(' ', trim((string) $output), 2), 2, '');
+        if ($type !== 'volume' || $name === '' || $this->persistentStorages()->where('name', $name)->exists()) {
+            return null;
+        }
+
+        return $name;
+    }
+
+    /**
+     * Use the unnamed volume that holds the current data as the data volume, so a restart keeps that data.
+     */
+    public function keepAnonymousDataVolume(string $volumeName): void
+    {
+        $storage = $this->persistentStorages()->where('mount_path', self::DATA_DIRECTORY)->first();
+        if ($storage) {
+            $storage->update(['name' => $volumeName]);
+
+            return;
+        }
+
+        LocalPersistentVolume::create([
+            'name' => $volumeName,
+            'mount_path' => self::DATA_DIRECTORY,
+            'resource_id' => $this->id,
+            'resource_type' => $this->getMorphClass(),
+        ]);
+    }
+
+    public function deleteVolumes()
+    {
+        $persistentStorages = $this->persistentStorages()->get() ?? collect();
+        if ($persistentStorages->count() === 0) {
+            return;
+        }
+        $server = data_get($this, 'destination.server');
+        foreach ($persistentStorages as $storage) {
+            instant_remote_process(['docker volume rm -f '.escapeshellarg($storage->name)], $server, false);
+        }
+    }
+
+    public function realStatus()
+    {
+        return $this->getRawOriginal('status');
+    }
+
+    public function status(): Attribute
+    {
+        return Attribute::make(
+            set: function ($value) {
+                if (str($value)->contains('(')) {
+                    $status = str($value)->before('(')->trim()->value();
+                    $health = str($value)->after('(')->before(')')->trim()->value() ?? 'unhealthy';
+                } elseif (str($value)->contains(':')) {
+                    $status = str($value)->before(':')->trim()->value();
+                    $health = str($value)->after(':')->trim()->value() ?? 'unhealthy';
+                } else {
+                    $status = $value;
+                    $health = 'unhealthy';
+                }
+
+                return "$status:$health";
+            },
+            get: function ($value) {
+                if (str($value)->contains('(')) {
+                    $status = str($value)->before('(')->trim()->value();
+                    $health = str($value)->after('(')->before(')')->trim()->value() ?? 'unhealthy';
+                } elseif (str($value)->contains(':')) {
+                    $status = str($value)->before(':')->trim()->value();
+                    $health = str($value)->after(':')->trim()->value() ?? 'unhealthy';
+                } else {
+                    $status = $value;
+                    $health = 'unhealthy';
+                }
+
+                return "$status:$health";
+            },
+        );
+    }
+
+    public function tags()
+    {
+        return $this->morphToMany(Tag::class, 'taggable');
+    }
+
+    public function project()
+    {
+        return data_get($this, 'environment.project');
+    }
+
+    public function sslCertificates()
+    {
+        return $this->morphMany(SslCertificate::class, 'resource');
+    }
+
+    public function link()
+    {
+        if (data_get($this, 'environment.project.uuid')) {
+            return route('project.database.configuration', [
+                'project_uuid' => data_get($this, 'environment.project.uuid'),
+                'environment_uuid' => data_get($this, 'environment.uuid'),
+                'database_uuid' => data_get($this, 'uuid'),
+            ]);
+        }
+
+        return null;
+    }
+
+    public function isLogDrainEnabled()
+    {
+        return data_get($this, 'is_log_drain_enabled', false);
+    }
+
+    public function portsMappings(): Attribute
+    {
+        return Attribute::make(
+            set: fn ($value) => $value === '' ? null : $value,
+        );
+    }
+
+    public function portsMappingsArray(): Attribute
+    {
+        return Attribute::make(
+            get: fn () => is_null($this->ports_mappings)
+                ? []
+                : explode(',', $this->ports_mappings),
+
+        );
+    }
+
+    public function team()
+    {
+        return data_get($this, 'environment.project.team');
+    }
+
+    public function databaseType(): Attribute
+    {
+        return new Attribute(
+            get: fn () => $this->type(),
+        );
+    }
+
+    public function type(): string
+    {
+        return 'standalone-clickhouse';
+    }
+
+    protected function internalDbUrl(): Attribute
+    {
+        return new Attribute(
+            get: function () {
+                $encodedUser = rawurlencode($this->clickhouse_admin_user);
+                $encodedPass = rawurlencode($this->clickhouse_admin_password);
+                $database = $this->clickhouse_db ?? 'default';
+
+                return "clickhouse://{$encodedUser}:{$encodedPass}@{$this->uuid}:9000/{$database}";
+            },
+        );
+    }
+
+    protected function externalDbUrl(): Attribute
+    {
+        return new Attribute(
+            get: function () {
+                if ($this->is_public && $this->public_port) {
+                    $serverIp = $this->destination->server->getIp;
+                    if (empty($serverIp)) {
+                        return null;
+                    }
+                    $serverHost = formatHostForUrl($serverIp);
+                    $encodedUser = rawurlencode($this->clickhouse_admin_user);
+                    $encodedPass = rawurlencode($this->clickhouse_admin_password);
+                    $database = $this->clickhouse_db ?? 'default';
+
+                    return "clickhouse://{$encodedUser}:{$encodedPass}@{$serverHost}:{$this->public_port}/{$database}";
+                }
+
+                return null;
+            }
+        );
+    }
+
+    public function environment()
+    {
+        return $this->belongsTo(Environment::class);
+    }
+
+    public function fileStorages()
+    {
+        return $this->morphMany(LocalFileVolume::class, 'resource');
+    }
+
+    public function destination()
+    {
+        return $this->morphTo();
+    }
+
+    public function environment_variables()
+    {
+        return $this->morphMany(EnvironmentVariable::class, 'resourceable');
+    }
+
+    public function runtime_environment_variables()
+    {
+        return $this->morphMany(EnvironmentVariable::class, 'resourceable');
+    }
+
+    public function persistentStorages()
+    {
+        return $this->morphMany(LocalPersistentVolume::class, 'resource');
+    }
+
+    public function scheduledBackups()
+    {
+        return $this->morphMany(ScheduledDatabaseBackup::class, 'database');
+    }
+
+    public function isBackupSolutionAvailable()
+    {
+        return true;
+    }
+}

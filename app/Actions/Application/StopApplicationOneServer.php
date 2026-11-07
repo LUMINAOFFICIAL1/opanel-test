@@ -1,0 +1,43 @@
+<?php
+
+namespace App\Actions\Application;
+
+use App\Models\Application;
+use App\Models\Server;
+use Lorisleiva\Actions\Concerns\AsAction;
+
+class StopApplicationOneServer
+{
+    use AsAction;
+
+    public function handle(Application $application, Server $server)
+    {
+        if ($application->destination->server->isSwarm()) {
+            return;
+        }
+        if (! $server->isFunctional()) {
+            return 'Server is not functional';
+        }
+        try {
+            $containers = getCurrentApplicationContainerStatus($server, $application, 0);
+            $timeout = $application->settings->stopGracePeriodSeconds();
+
+            if ($containers->count() > 0) {
+                foreach ($containers as $container) {
+                    $containerName = data_get($container, 'Names');
+                    if ($containerName) {
+                        instant_remote_process(
+                            [
+                                dockerStopCommand($timeout, escapeshellarg($containerName), $server),
+                                dockerRemoveCommand($containerName),
+                            ],
+                            $server
+                        );
+                    }
+                }
+            }
+        } catch (\Exception $e) {
+            return $e->getMessage();
+        }
+    }
+}

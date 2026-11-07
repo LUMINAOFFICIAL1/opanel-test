@@ -1,0 +1,186 @@
+<?php
+
+namespace App\Livewire\Team;
+
+use App\Enums\AccessScope;
+use App\Enums\Role;
+use App\Livewire\Team\Member\Access;
+use App\Models\TeamInvitation;
+use App\Models\User;
+use App\Services\Access\AccessResolver;
+use App\Services\Access\Grant;
+use Illuminate\Foundation\Auth\Access\AuthorizesRequests;
+use Illuminate\Notifications\Messages\MailMessage;
+use Illuminate\Support\Facades\Crypt;
+use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Str;
+use Illuminate\Validation\Rule;
+use Livewire\Attributes\On;
+use Livewire\Component;
+
+class InviteLink extends Component
+{
+    use AuthorizesRequests;
+
+    public string $email;
+
+    public string $role = 'member';
+
+    protected function rules(): array
+    {
+        return [
+            'email' => 'required|email',
+            'role' => ['required', Rule::enum(Role::class)],
+        ];
+    }
+
+    /**
+     * Grants for an invited member, set by the access editor. Checked again on invite.
+     *
+     * @var list<array{scope: string, uuid: string|null, levels: list<string>}>
+     */
+    public array $grants = [];
+
+    public function mount()
+    {
+        $this->email = isDev() ? 'test3@example.com' : '';
+        $this->grants = Grant::listToArray(AccessResolver::defaultMemberGrants());
+    }
+
+    /**
+     * @param  list<array{scope: string, uuid: string|null, levels: list<string>}>  $access
+     */
+    #[On('invitation-access-chosen')]
+    public function setGrants(array $access): void
+    {
+        $this->grants = Grant::listToArray(Grant::listFrom($access));
+    }
+
+    public function viaEmail()
+    {
+        $this->generateInviteLink(sendEmail: true);
+    }
+
+    public function viaLink()
+    {
+        $this->generateInviteLink(sendEmail: false);
+    }
+
+    private function invitationUrl(string $routeName, array $parameters): string
+    {
+        $fqdn = instanceSettings()->fqdn;
+        if (filled($fqdn)) {
+            return rtrim($fqdn, '/').route($routeName, $parameters, false);
+        }
+
+        return route($routeName, $parameters);
+    }
+
+    private function generateInviteLink(bool $sendEmail = false)
+    {
+        try {
+            $this->authorize('manageInvitations', currentTeam());
+            $this->validate();
+
+            // Prevent privilege escalation: users cannot invite someone with higher privileges
+            $userRole = Role::tryFrom((string) auth()->user()->role());
+            if (is_null($userRole) || ($userRole === Role::MEMBER && Role::from($this->role)->gt(Role::MEMBER))) {
+                throw new \Exception('Members cannot invite admins or owners.');
+            }
+            if ($userRole === Role::ADMIN && Role::from($this->role) === Role::OWNER) {
+                throw new \Exception('Admins cannot invite owners.');
+            }
+
+            $access = null;
+            if ($this->role === 'member') {
+                $grants = Grant::listFrom($this->grants);
+                $validTargets = Access::validTargets(currentTeam()->id);
+                foreach ($grants as $grant) {
+                    $target = $grant->scope === AccessScope::Team ? 'team' : "{$grant->scope->value}:{$grant->uuid}";
+                    if ($grant->levels === [] || ! in_array($target, $validTargets, true)) {
+                        throw new \Exception('Choose valid member access.');
+                    }
+                }
+                $access = Grant::listToArray($grants);
+            }
+
+            $this->email = strtolower($this->email);
+
+            $member_emails = currentTeam()->members()->get()->pluck('email');
+            if ($member_emails->contains($this->email)) {
+                return handleError(livewire: $this, customErrorMessage: "$this->email is already a member of ".currentTeam()->name.'.');
+            }
+            $invitation = TeamInvitation::ownedByCurrentTeam()->whereEmail($this->email)->first();
+            if (! is_null($invitation)) {
+                $invitationValid = $invitation->isValid();
+                if ($invitationValid) {
+                    return handleError(livewire: $this, customErrorMessage: "Pending invitation already exists for $this->email.");
+                } else {
+                    $invitation->delete();
+                }
+            }
+
+            // Look up the user after the expired invitation is removed, because that can delete an unused account.
+            $uuid = new_public_id(32);
+            $link = $this->invitationUrl('team.invitation.show', ['uuid' => $uuid]);
+            $user = User::whereEmail($this->email)->first();
+
+            // A user who never set a password cannot log in, so they get a magic link with a new temporary password.
+            if (is_null($user) || $user->canReceiveInvitationLoginFrom(currentTeam()->id)) {
+                $password = Str::password();
+                if (is_null($user)) {
+                    $user = User::create([
+                        'name' => str($this->email)->before('@'),
+                        'email' => $this->email,
+                        'password' => Hash::make($password),
+                        'force_password_reset' => true,
+                    ]);
+                } else {
+                    $user->forceFill(['password' => Hash::make($password)])->save();
+                }
+                $token = Crypt::encryptString("{$user->email}@@@{$uuid}@@@{$password}");
+                $link = $this->invitationUrl('auth.link', ['token' => $token]);
+            }
+
+            $invitation = TeamInvitation::firstOrCreate([
+                'team_id' => currentTeam()->id,
+                'uuid' => $uuid,
+                'email' => $this->email,
+                'role' => $this->role,
+                'link' => $link,
+                'via' => $sendEmail ? 'email' : 'link',
+            ], ['access' => $access]);
+            auditLog('ui.team_invitation.created', [
+                'team_id' => currentTeam()->id,
+                'invitation_uuid' => $invitation->uuid,
+                'invitation_email' => $invitation->email,
+                'role' => $invitation->role,
+                'via' => $invitation->via,
+                'access' => $invitation->access,
+            ]);
+            if ($sendEmail) {
+                $mail = new MailMessage;
+                $mail->view('emails.invitation-link', [
+                    'team' => currentTeam()->name,
+                    'invitation_link' => $link,
+                ]);
+                $mail->subject('You have been invited to '.currentTeam()->name.' on '.config('app.name').'.');
+                send_user_an_email($mail, $this->email);
+                $this->dispatch('success', 'Invitation sent via email.');
+                $this->dispatch('refreshInvitations');
+
+                return;
+            } else {
+                $this->dispatch('success', 'Invitation link generated.');
+                $this->dispatch('refreshInvitations');
+            }
+        } catch (\Throwable $e) {
+            $error_message = $e->getMessage();
+            if ($e->getCode() === '23505') {
+                $error_message = 'Invitation already sent.';
+            }
+
+            return handleError(error: $e, livewire: $this, customErrorMessage: $error_message);
+        }
+    }
+}

@@ -1,0 +1,47 @@
+# documentation: https://docs.rxresu.me/self-hosting/docker
+# slogan: A one-of-a-kind resume builder that keeps your privacy in mind.
+# category: productivity
+# tags: reactive-resume,resume-builder,open-source,2fa
+# logo: svgs/rxresume.svg
+# port: 3000
+
+services:
+  reactive-resume:
+    image: amruthpillai/reactive-resume:v6
+    environment:
+      - SERVICE_URL_REACTIVERESUME_3000
+      - APP_URL=${SERVICE_URL_REACTIVERESUME}
+      - DATABASE_URL=postgresql://${SERVICE_USER_POSTGRES}:${SERVICE_PASSWORD_POSTGRES}@postgres:5432/${POSTGRES_DB:-reactive_resume}
+      - AUTH_SECRET=${SERVICE_PASSWORD_64_AUTHSECRET}
+      - ENCRYPTION_SECRET=${SERVICE_PASSWORD_64_ENCRYPTIONSECRET}
+      - FLAG_DISABLE_SIGNUPS=${FLAG_DISABLE_SIGNUPS:-false}
+      - FLAG_DISABLE_EMAIL_AUTH=${FLAG_DISABLE_EMAIL_AUTH:-false}
+    volumes:
+      - reactive-resume-data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - '-e'
+        - "fetch('http://127.0.0.1:3000/api/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-reactive_resume}
+      - POSTGRES_USER=${SERVICE_USER_POSTGRES}
+      - POSTGRES_PASSWORD=${SERVICE_PASSWORD_POSTGRES}
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 20s
+      retries: 10

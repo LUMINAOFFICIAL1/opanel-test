@@ -1,0 +1,664 @@
+<?php
+
+namespace App\Models;
+
+use App\Actions\User\RevokeUserTeamTokens;
+use App\Enums\AccessLevel;
+use App\Jobs\UpdateStripeCustomerEmailJob;
+use App\Notifications\Channels\SendsEmail;
+use App\Notifications\TransactionalEmails\EmailChangeVerification;
+use App\Notifications\TransactionalEmails\ResetPassword as TransactionalEmailsResetPassword;
+use App\Services\Access\AccessResolver;
+use App\Services\ChangelogService;
+use App\Traits\DeletesUserSessions;
+use DateTimeInterface;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Foundation\Auth\User as Authenticatable;
+use Illuminate\Notifications\Messages\MailMessage;
+use Illuminate\Notifications\Notifiable;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Config;
+use Illuminate\Support\Facades\URL;
+use Laravel\Fortify\Contracts\PasskeyUser;
+use Laravel\Fortify\PasskeyAuthenticatable;
+use Laravel\Fortify\TwoFactorAuthenticatable;
+use Laravel\Sanctum\HasApiTokens;
+use Laravel\Sanctum\NewAccessToken;
+use OpenApi\Attributes as OA;
+
+#[OA\Schema(
+    description: 'User model',
+    type: 'object',
+    properties: [
+        'id' => ['type' => 'integer', 'description' => 'The user identifier in the database.'],
+        'name' => ['type' => 'string', 'description' => 'The user name.'],
+        'email' => ['type' => 'string', 'description' => 'The user email.'],
+        'email_verified_at' => ['type' => 'string', 'description' => 'The date when the user email was verified.'],
+        'created_at' => ['type' => 'string', 'description' => 'The date when the user was created.'],
+        'updated_at' => ['type' => 'string', 'description' => 'The date when the user was updated.'],
+        'two_factor_confirmed_at' => ['type' => 'string', 'description' => 'The date when the user two factor was confirmed.'],
+        'force_password_reset' => ['type' => 'boolean', 'description' => 'The flag to force the user to reset the password.'],
+        'marketing_emails' => ['type' => 'boolean', 'description' => 'The flag to receive marketing emails.'],
+    ],
+)]
+class User extends Authenticatable implements PasskeyUser, SendsEmail
+{
+    use DeletesUserSessions, HasApiTokens, HasFactory, Notifiable, PasskeyAuthenticatable, TwoFactorAuthenticatable;
+
+    protected $fillable = [
+        'name',
+        'email',
+        'password',
+        'current_team_id',
+        'force_password_reset',
+        'marketing_emails',
+        'pending_email',
+        'email_change_code',
+        'email_change_code_expires_at',
+        'avatar_path',
+        'avatar_storage_type',
+        'avatar_s3_storage_id',
+    ];
+
+    protected $hidden = [
+        'password',
+        'remember_token',
+        'two_factor_recovery_codes',
+        'two_factor_secret',
+        'created_before_oauth_identities',
+    ];
+
+    protected $casts = [
+        'created_before_oauth_identities' => 'boolean',
+        'current_team_id' => 'integer',
+        'email_verified_at' => 'datetime',
+        'force_password_reset' => 'boolean',
+        'show_boarding' => 'boolean',
+        'email_change_code_expires_at' => 'datetime',
+    ];
+
+    /**
+     * Set the email attribute to lowercase.
+     */
+    public function setEmailAttribute($value)
+    {
+        $this->attributes['email'] = strtolower($value);
+    }
+
+    /**
+     * Set the pending_email attribute to lowercase.
+     */
+    public function setPendingEmailAttribute($value)
+    {
+        $this->attributes['pending_email'] = $value ? strtolower($value) : null;
+    }
+
+    protected static function boot()
+    {
+        parent::boot();
+
+        static::created(function (User $user) {
+            $team = [
+                'name' => $user->name."'s Team",
+                'personal_team' => true,
+                'show_boarding' => true,
+            ];
+            if ($user->id === 0) {
+                $team['id'] = 0;
+                $team['name'] = 'Root Team';
+            }
+            $new_team = $user->id === 0 ? Team::find(0) : null;
+
+            if ($new_team !== null) {
+                $new_team->forceFill($team);
+                $new_team->save();
+
+                if (! $user->teams()->whereKey($new_team->id)->exists()) {
+                    $user->teams()->attach($new_team, ['role' => 'owner']);
+                } else {
+                    $user->teams()->updateExistingPivot($new_team->id, ['role' => 'owner']);
+                }
+
+                return;
+            }
+
+            $new_team = (new Team)->forceFill($team);
+            $new_team->save();
+
+            $user->teams()->attach($new_team, ['role' => 'owner']);
+        });
+
+        static::deleting(function (User $user) {
+            \DB::transaction(function () use ($user) {
+                RevokeUserTeamTokens::forUser($user);
+
+                $teams = $user->teams;
+                foreach ($teams as $team) {
+                    $user_alone_in_team = $team->members->count() === 1;
+
+                    // Prevent deletion if user is alone in root team
+                    if ($team->id === 0 && $user_alone_in_team) {
+                        throw new \Exception('User is alone in the root team, cannot delete');
+                    }
+
+                    if ($user_alone_in_team) {
+                        static::finalizeTeamDeletion($user, $team);
+                        // Delete any pending team invitations for this user
+                        TeamInvitation::whereEmail($user->email)->delete();
+
+                        continue;
+                    }
+
+                    // Load the user's role for this team
+                    $userRole = $team->members->where('id', $user->id)->first()?->pivot?->role;
+
+                    if ($userRole === 'owner') {
+                        $found_other_owner_or_admin = $team->members->filter(function ($member) use ($user) {
+                            return ($member->pivot->role === 'owner' || $member->pivot->role === 'admin') && $member->id !== $user->id;
+                        })->first();
+
+                        if ($found_other_owner_or_admin) {
+                            $team->members()->detach($user->id);
+
+                            continue;
+                        } else {
+                            $found_other_member_who_is_not_owner = $team->members->filter(function ($member) {
+                                return $member->pivot->role === 'member';
+                            })->first();
+
+                            if ($found_other_member_who_is_not_owner) {
+                                $found_other_member_who_is_not_owner->pivot->role = 'owner';
+                                $found_other_member_who_is_not_owner->pivot->save();
+                                $team->members()->detach($user->id);
+                            } else {
+                                static::finalizeTeamDeletion($user, $team);
+                            }
+
+                            continue;
+                        }
+                    } else {
+                        $team->members()->detach($user->id);
+                    }
+                }
+            });
+        });
+
+        static::deleted(fn (User $user) => AuditEvent::anonymizeUser($user));
+    }
+
+    /**
+     * Finalize team deletion by cleaning up all associated resources
+     */
+    private static function finalizeTeamDeletion(User $user, Team $team)
+    {
+        $servers = $team->servers;
+        foreach ($servers as $server) {
+            $resources = $server->definedResources();
+            foreach ($resources as $resource) {
+                $resource->forceDelete();
+            }
+            $server->forceDelete();
+        }
+
+        $projects = $team->projects;
+        foreach ($projects as $project) {
+            $project->forceDelete();
+        }
+
+        $team->members()->detach($user->id);
+        $team->delete();
+    }
+
+    /**
+     * Delete the user if they are a provisional invitee that never joined any team.
+     * This is used to clean up users that have been invited, did not accept the invitation (and did not verify their email and have a force password reset).
+     * Users that already belong to a team other than their own personal team, or still have pending invitations, are kept.
+     */
+    public function deleteIfNotVerifiedAndForcePasswordReset(): void
+    {
+        if ($this->isUnusedInvitedAccount()) {
+            $this->delete();
+        }
+    }
+
+    /**
+     * Whether an invitation created this account and nobody uses it: the owner never set a password,
+     * it has no pending invitations, and it belongs to no team other than its own personal team.
+     */
+    public function isUnusedInvitedAccount(): bool
+    {
+        return $this->needsInitialInvitationLogin()
+            && ! TeamInvitation::whereEmail($this->email)->exists();
+    }
+
+    /**
+     * Whether a new invitation from the team may carry a magic login link for this account.
+     * A pending invitation of another team keeps the only login, so the admin of a second team cannot sign in as the invitee.
+     */
+    public function canReceiveInvitationLoginFrom(int $teamId): bool
+    {
+        return $this->needsInitialInvitationLogin()
+            && TeamInvitation::whereEmail($this->email)
+                ->where('team_id', '!=', $teamId)
+                ->get()
+                ->every(fn (TeamInvitation $invitation) => $invitation->hasExpired());
+    }
+
+    public function needsInitialInvitationLogin(): bool
+    {
+        return ! $this->hasVerifiedEmail()
+            && $this->force_password_reset === true
+            && ! $this->belongsToNonPersonalTeam();
+    }
+
+    /**
+     * Whether the user is a member of any team other than a personal team where they are the only member.
+     */
+    private function belongsToNonPersonalTeam(): bool
+    {
+        return $this->teams()
+            ->where(function ($query) {
+                $query->where('personal_team', false)
+                    ->orWhereHas('members', fn ($members) => $members->where('users.id', '!=', $this->id));
+            })
+            ->exists();
+    }
+
+    public function recreate_personal_team()
+    {
+        $team = [
+            'name' => $this->name."'s Team",
+            'personal_team' => true,
+            'show_boarding' => true,
+        ];
+        if ($this->id === 0) {
+            $team['id'] = 0;
+            $team['name'] = 'Root Team';
+        }
+        $new_team = (new Team)->forceFill($team);
+        $new_team->save();
+        $this->teams()->attach($new_team, ['role' => 'owner']);
+
+        return $new_team;
+    }
+
+    public function createToken(string $name, array $abilities = ['read'], ?DateTimeInterface $expiresAt = null, ?int $teamId = null)
+    {
+        $plainTextToken = PersonalAccessToken::generateSecret();
+
+        $token = $this->tokens()->create([
+            'name' => $name,
+            'token' => hash('sha256', $plainTextToken),
+            'abilities' => $abilities,
+            'expires_at' => $expiresAt,
+            'team_id' => $teamId ?? session('currentTeam')->id,
+        ]);
+
+        return new NewAccessToken($token, $token->getKey().'|'.$plainTextToken);
+    }
+
+    public function teams()
+    {
+        return $this->belongsToMany(Team::class)->withPivot('role', 'access');
+    }
+
+    public function changelogReads()
+    {
+        return $this->hasMany(UserChangelogRead::class);
+    }
+
+    public function stars(): HasMany
+    {
+        return $this->hasMany(Star::class);
+    }
+
+    public function getUnreadChangelogCount(): int
+    {
+        return app(ChangelogService::class)->getUnreadCountForUser($this);
+    }
+
+    public function getRecipients(): array
+    {
+        return [$this->email];
+    }
+
+    public function sendVerificationEmail()
+    {
+        $mail = new MailMessage;
+        // Sign the link for the configured instance URL instead of the request Host header.
+        $urlGenerator = clone URL::getFacadeRoot();
+        $instanceUrl = rtrim(base_url(), '/');
+        $urlGenerator->forceRootUrl($instanceUrl);
+        $urlGenerator->forceScheme(parse_url($instanceUrl, PHP_URL_SCHEME) ?: 'http');
+        $url = $urlGenerator->temporarySignedRoute(
+            'verify.verify',
+            Carbon::now()->addMinutes(Config::get('auth.verification.expire', 60)),
+            [
+                'id' => $this->getKey(),
+                'hash' => hash('sha256', $this->getEmailForVerification()),
+            ]
+        );
+        $mail->view('emails.email-verification', [
+            'url' => $url,
+        ]);
+        $mail->subject('Coolify: Verify your email.');
+        send_user_an_email($mail, $this->email);
+    }
+
+    public function sendPasswordResetNotification($token): void
+    {
+        $this?->notify(new TransactionalEmailsResetPassword($token));
+    }
+
+    public function isAdmin()
+    {
+        return $this->role() === 'admin' || $this->role() === 'owner';
+    }
+
+    public function isOwner()
+    {
+        return $this->role() === 'owner';
+    }
+
+    public function isMember()
+    {
+        return $this->role() === 'member';
+    }
+
+    public function isAdminFromSession()
+    {
+        if (Auth::id() === 0) {
+            return true;
+        }
+        $teams = $this->teams()->get();
+
+        $is_part_of_root_team = $teams->where('id', 0)->first();
+        $is_admin_of_root_team = $is_part_of_root_team &&
+            ($is_part_of_root_team->pivot->role === 'admin' || $is_part_of_root_team->pivot->role === 'owner');
+
+        if ($is_part_of_root_team && $is_admin_of_root_team) {
+            return true;
+        }
+        $team = $teams->where('id', session('currentTeam')->id)->first();
+        $role = data_get($team, 'pivot.role');
+
+        return $role === 'admin' || $role === 'owner';
+    }
+
+    public function isInstanceAdmin()
+    {
+        $found_root_team = $this->teams->filter(function ($team) {
+            if ($team->id == 0) {
+                $role = $team->pivot->role;
+                if ($role !== 'admin' && $role !== 'owner') {
+                    return false;
+                }
+
+                return true;
+            }
+
+            return false;
+        });
+
+        return $found_root_team->count() > 0;
+    }
+
+    public function currentTeam(): ?Team
+    {
+        $sessionTeamId = data_get(session('currentTeam'), 'id');
+
+        // Fallback for stateless API requests: resolve team from Sanctum token
+        if (is_null($sessionTeamId) && $this->currentAccessToken()) {
+            $sessionTeamId = data_get($this->currentAccessToken(), 'team_id');
+        }
+
+        if (is_null($sessionTeamId)) {
+            return null;
+        }
+
+        // Check if user actually belongs to this team
+        if (! $this->teams->contains('id', $sessionTeamId)) {
+            session()->forget('currentTeam');
+            Cache::forget('user:'.$this->id.':team:'.$sessionTeamId);
+
+            return null;
+        }
+
+        return Cache::remember('user:'.$this->id.':team:'.$sessionTeamId, 3600, function () use ($sessionTeamId) {
+            return Team::find($sessionTeamId);
+        });
+    }
+
+    /**
+     * Resolve the team to activate when the session has no current team
+     * (fresh login or an invalidated session).
+     *
+     * Returns the user's last active team when they still belong to it, or the
+     * sole team of a single-team user. Returns null when the choice is ambiguous
+     * (more than one team and no valid stored preference) — the caller must then
+     * prompt the user to pick a team instead of defaulting silently.
+     */
+    public function resolveStoredTeam(): ?Team
+    {
+        if (! is_null($this->current_team_id)) {
+            $storedTeam = $this->teams->firstWhere('id', $this->current_team_id);
+            if ($storedTeam) {
+                return $storedTeam;
+            }
+        }
+
+        if ($this->teams->count() === 1) {
+            return $this->teams->first();
+        }
+
+        return null;
+    }
+
+    /**
+     * Reset the persisted active team when it points to the given team.
+     *
+     * Called when the user is removed from a team (or the team is deleted) so a
+     * stale current_team_id can never be trusted after the fact. Read paths
+     * already re-validate membership; this is defense-in-depth that clears the
+     * dangling value at the source event instead of relying on self-healing.
+     */
+    public function clearStoredTeamIfMatches(int $teamId): void
+    {
+        // Atomic conditional update: only null the column when the database value
+        // still points at this team, so a newer team selection made concurrently
+        // (in another request) is preserved rather than clobbered.
+        static::query()
+            ->whereKey($this->getKey())
+            ->where('current_team_id', $teamId)
+            ->update(['current_team_id' => null]);
+
+        if ($this->current_team_id === $teamId) {
+            $this->current_team_id = null;
+        }
+    }
+
+    public function role(): ?string
+    {
+        if (data_get($this, 'pivot')) {
+            return $this->pivot->role;
+        }
+
+        $current = $this->currentTeam();
+        if (is_null($current)) {
+            return null;
+        }
+
+        $team = $this->teams->where('id', $current->id)->first();
+
+        return data_get($team, 'pivot.role');
+    }
+
+    /**
+     * Get the user's role in a specific team
+     */
+    public function roleInTeam(int $teamId): ?string
+    {
+        $team = $this->teams->where('id', $teamId)->first();
+
+        return data_get($team, 'pivot.role');
+    }
+
+    /**
+     * Check the access grants of the user (and the API token of the request) on a project, environment, or resource.
+     */
+    public function canAccess(AccessLevel $level, Model $target): bool
+    {
+        return app(AccessResolver::class)->allows($this, $level, $target);
+    }
+
+    /**
+     * Check if the user is an admin or owner of a specific team
+     */
+    public function isAdminOfTeam(int $teamId): bool
+    {
+        $team = $this->teams->where('id', $teamId)->first();
+
+        if (! $team) {
+            return false;
+        }
+
+        $role = $team->pivot->role ?? null;
+
+        return $role === 'admin' || $role === 'owner';
+    }
+
+    /**
+     * Check if the user can access system resources (team_id=0)
+     * Must be admin/owner of root team
+     */
+    public function canAccessSystemResources(): bool
+    {
+        // Check if user is member of root team
+        $rootTeam = $this->teams->where('id', 0)->first();
+
+        if (! $rootTeam) {
+            return false;
+        }
+
+        // Check if user is admin or owner of root team
+        return $this->isAdminOfTeam(0);
+    }
+
+    public function requestEmailChange(string $newEmail): void
+    {
+        // Generate 6-digit code
+        $code = sprintf('%06d', random_int(0, 999999));
+
+        // Set expiration using config value
+        $expiryMinutes = config('constants.email_change.verification_code_expiry_minutes', 10);
+        $expiresAt = Carbon::now()->addMinutes($expiryMinutes);
+
+        $this->fill([
+            'pending_email' => $newEmail,
+            'email_change_code' => $code,
+            'email_change_code_expires_at' => $expiresAt,
+        ])->save();
+
+        // Send verification email to new address
+        $this->notify(new EmailChangeVerification($this, $code, $newEmail, $expiresAt));
+    }
+
+    public function isEmailChangeCodeValid(string $code): bool
+    {
+        return $this->email_change_code === $code
+            && $this->email_change_code_expires_at
+            && Carbon::now()->lessThan($this->email_change_code_expires_at);
+    }
+
+    public function confirmEmailChange(string $code): bool
+    {
+        if (! $this->isEmailChangeCodeValid($code)) {
+            return false;
+        }
+
+        $oldEmail = $this->email;
+        $newEmail = $this->pending_email;
+
+        // Update email and clear change request fields
+        $this->update([
+            'email' => $newEmail,
+            'pending_email' => null,
+            'email_change_code' => null,
+            'email_change_code_expires_at' => null,
+        ]);
+
+        // For cloud users, dispatch job to update Stripe customer email asynchronously
+        $currentTeam = $this->currentTeam();
+        if (isCloud() && $currentTeam?->subscription) {
+            dispatch(new UpdateStripeCustomerEmailJob(
+                $currentTeam,
+                $this->id,
+                $newEmail,
+                $oldEmail
+            ));
+        }
+
+        return true;
+    }
+
+    public function clearEmailChangeRequest(): void
+    {
+        $this->update([
+            'pending_email' => null,
+            'email_change_code' => null,
+            'email_change_code_expires_at' => null,
+        ]);
+    }
+
+    public function hasEmailChangeRequest(): bool
+    {
+        return ! is_null($this->pending_email)
+            && ! is_null($this->email_change_code)
+            && $this->email_change_code_expires_at
+            && Carbon::now()->lessThan($this->email_change_code_expires_at);
+    }
+
+    public function oauthIdentities(): HasMany
+    {
+        return $this->hasMany(OauthIdentity::class);
+    }
+
+    public function hasSsoIdentity(): bool
+    {
+        return $this->oauthIdentities()->exists();
+    }
+
+    /**
+     * Hex handle: iOS Safari corrupts raw binary handles (laravel/passkeys-server#41).
+     */
+    public function getPasskeyUserHandle(): string
+    {
+        return hash_hmac(
+            'sha256',
+            $this->getTable().'|'.$this->getKey(),
+            Config::string('passkeys.user_handle_secret'),
+        );
+    }
+
+    /**
+     * Check if the user has a password set.
+     */
+    public function hasPassword(): bool
+    {
+        return ! empty($this->password);
+    }
+
+    /**
+     * Whether destructive actions must be confirmed with the account password.
+     * Users with a linked OAuth identity only confirm with the dialog's typed
+     * confirmation, and users without a password have no way to confirm.
+     */
+    public function requiresPasswordConfirmation(): bool
+    {
+        return $this->hasPassword() && ! $this->hasSsoIdentity();
+    }
+}

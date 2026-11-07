@@ -1,0 +1,129 @@
+<?php
+
+namespace App\Http;
+
+use App\Http\Middleware\AddServerTimingHeaders;
+use App\Http\Middleware\ApiAbility;
+use App\Http\Middleware\ApiIpAllowed;
+use App\Http\Middleware\ApiSensitiveData;
+use App\Http\Middleware\Authenticate;
+use App\Http\Middleware\CanAccessTerminal;
+use App\Http\Middleware\CanCreateResources;
+use App\Http\Middleware\CanUpdateResource;
+use App\Http\Middleware\CheckForcePasswordReset;
+use App\Http\Middleware\DecideWhatToDoWithUser;
+use App\Http\Middleware\EncryptCookies;
+use App\Http\Middleware\EnsureMcpEnabled;
+use App\Http\Middleware\EnsureTeamMcpEnabled;
+use App\Http\Middleware\EnsureTeamWideAccess;
+use App\Http\Middleware\EnsureTokenBelongsToCurrentTeamMember;
+use App\Http\Middleware\KeepConcurrentTeamSwitch;
+use App\Http\Middleware\PreventRequestsDuringMaintenance;
+use App\Http\Middleware\RedirectIfAuthenticated;
+use App\Http\Middleware\RequirePassword;
+use App\Http\Middleware\RequireTeamTwoFactor;
+use App\Http\Middleware\ThrottleFailedApiRequests;
+use App\Http\Middleware\TrimStrings;
+use App\Http\Middleware\TrustProxies;
+use App\Http\Middleware\ValidateSignature;
+use App\Http\Middleware\VerifyCsrfToken;
+use Illuminate\Auth\Middleware\AuthenticateWithBasicAuth;
+use Illuminate\Auth\Middleware\Authorize;
+use Illuminate\Auth\Middleware\EnsureEmailIsVerified;
+use Illuminate\Cookie\Middleware\AddQueuedCookiesToResponse;
+use Illuminate\Foundation\Http\Kernel as HttpKernel;
+use Illuminate\Foundation\Http\Middleware\ConvertEmptyStringsToNull;
+use Illuminate\Foundation\Http\Middleware\InvokeDeferredCallbacks;
+use Illuminate\Foundation\Http\Middleware\ValidatePostSize;
+use Illuminate\Http\Middleware\HandleCors;
+use Illuminate\Http\Middleware\SetCacheHeaders;
+use Illuminate\Routing\Middleware\SubstituteBindings;
+use Illuminate\Routing\Middleware\ThrottleRequests;
+use Illuminate\Session\Middleware\AuthenticateSession;
+use Illuminate\Session\Middleware\StartSession;
+use Illuminate\View\Middleware\ShareErrorsFromSession;
+use Laravel\Sanctum\Http\Middleware\CheckAbilities;
+use Laravel\Sanctum\Http\Middleware\CheckForAnyAbility;
+
+class Kernel extends HttpKernel
+{
+    /**
+     * The application's global HTTP middleware stack.
+     *
+     * These middleware are run during every request to your application.
+     *
+     * @var array<int, class-string|string>
+     */
+    protected $middleware = [
+        // Outermost so Server-Timing includes the full middleware + app cost.
+        AddServerTimingHeaders::class,
+        TrustProxies::class,
+        HandleCors::class,
+        ThrottleFailedApiRequests::class,
+        PreventRequestsDuringMaintenance::class,
+        ValidatePostSize::class,
+        TrimStrings::class,
+        ConvertEmptyStringsToNull::class,
+        InvokeDeferredCallbacks::class,
+
+    ];
+
+    /**
+     * The application's route middleware groups.
+     *
+     * @var array<string, array<int, class-string|string>>
+     */
+    protected $middlewareGroups = [
+        'web' => [
+            EncryptCookies::class,
+            AddQueuedCookiesToResponse::class,
+            StartSession::class,
+            KeepConcurrentTeamSwitch::class,
+            ShareErrorsFromSession::class,
+            VerifyCsrfToken::class,
+            SubstituteBindings::class,
+            CheckForcePasswordReset::class,
+            DecideWhatToDoWithUser::class,
+            RequireTeamTwoFactor::class,
+
+        ],
+
+        'api' => [
+            // \Laravel\Sanctum\Http\Middleware\EnsureFrontendRequestsAreStateful::class,
+            ThrottleRequests::class.':api',
+            SubstituteBindings::class,
+        ],
+    ];
+
+    /**
+     * The application's middleware aliases.
+     *
+     * Aliases may be used to conveniently assign middleware to routes and groups.
+     *
+     * @var array<string, class-string|string>
+     */
+    protected $middlewareAliases = [
+        'auth' => Authenticate::class,
+        'auth.basic' => AuthenticateWithBasicAuth::class,
+        'auth.session' => AuthenticateSession::class,
+        'cache.headers' => SetCacheHeaders::class,
+        'can' => Authorize::class,
+        'guest' => RedirectIfAuthenticated::class,
+        'password.confirm' => RequirePassword::class,
+        'signed' => ValidateSignature::class,
+        'throttle' => ThrottleRequests::class,
+        'verified' => EnsureEmailIsVerified::class,
+        'abilities' => CheckAbilities::class,
+        'ability' => CheckForAnyAbility::class,
+        'api.ability' => ApiAbility::class,
+        'api.sensitive' => ApiSensitiveData::class,
+        'api.token.team' => EnsureTokenBelongsToCurrentTeamMember::class,
+        'can.create.resources' => CanCreateResources::class,
+        'can.update.resource' => CanUpdateResource::class,
+        'can.access.terminal' => CanAccessTerminal::class,
+        'access.team-wide' => EnsureTeamWideAccess::class,
+        'mcp.enabled' => EnsureMcpEnabled::class,
+        'api.ip.allowed' => ApiIpAllowed::class,
+        'mcp.team.enabled' => EnsureTeamMcpEnabled::class,
+    ];
+}

@@ -1,0 +1,291 @@
+<?php
+
+namespace App\Livewire\Project\New;
+
+use App\Models\Application;
+use App\Models\GiteaApp;
+use App\Models\GithubApp;
+use App\Models\GitlabApp;
+use App\Models\PrivateKey;
+use App\Models\Project;
+use App\Rules\ValidGitBranch;
+use App\Rules\ValidGitRepositoryUrl;
+use App\Support\ValidationPatterns;
+use App\Traits\HasRepositoryDetection;
+use Illuminate\Foundation\Auth\Access\AuthorizesRequests;
+use Illuminate\Support\Facades\Gate;
+use Illuminate\Support\Str;
+use Livewire\Component;
+use Spatie\Url\Url;
+
+class GithubPrivateRepositoryDeployKey extends Component
+{
+    use AuthorizesRequests;
+    use HasRepositoryDetection;
+
+    public $current_step = 'private_keys';
+
+    public $parameters;
+
+    public $query;
+
+    public $private_keys = [];
+
+    public int $private_key_id;
+
+    public int $port = 3000;
+
+    public string $type;
+
+    public bool $is_static = false;
+
+    public ?string $publish_directory = null;
+
+    public ?string $base_directory = '/';
+
+    // In case of docker compose
+    public ?string $docker_compose_location = '/docker-compose.yaml';
+    // End of docker compose
+
+    public string $repository_url;
+
+    public string $branch;
+
+    public $build_pack = 'railpack';
+
+    public bool $show_is_static = true;
+
+    private object $repository_url_parsed;
+
+    private GithubApp|GitlabApp|GiteaApp|string $git_source = 'other';
+
+    private ?string $git_host = null;
+
+    private ?string $git_repository = null;
+
+    protected function rules()
+    {
+        return [
+            'repository_url' => ['required', 'string', new ValidGitRepositoryUrl],
+            'branch' => ['required', 'string', new ValidGitBranch],
+            'port' => 'required|numeric',
+            'is_static' => 'required|boolean',
+            'publish_directory' => 'nullable|string',
+            'build_pack' => 'required|string',
+            'base_directory' => ValidationPatterns::directoryPathRules(),
+            'docker_compose_location' => ValidationPatterns::filePathRules(),
+        ];
+    }
+
+    protected $validationAttributes = [
+        'repository_url' => 'Repository',
+        'branch' => 'Branch',
+        'port' => 'Port',
+        'is_static' => 'Is static',
+        'publish_directory' => 'Publish directory',
+        'build_pack' => 'Build pack',
+        'base_directory' => 'Base directory',
+    ];
+
+    public function mount()
+    {
+        if (isDev()) {
+            $this->repository_url = 'https://github.com/coollabsio/coolify-examples/tree/main';
+        }
+        $this->parameters = get_route_parameters();
+        $this->query = request()->query();
+        if (! Gate::allows('useTeamCredentials')) {
+            $this->private_keys = [];
+        } elseif (isDev()) {
+            $this->private_keys = PrivateKey::where('team_id', currentTeam()->id)->get();
+        } else {
+            $this->private_keys = PrivateKey::where('team_id', currentTeam()->id)->where('id', '!=', 0)->get();
+        }
+    }
+
+    public function updatedBuildPack()
+    {
+        if ($this->build_pack === 'nixpacks' || $this->build_pack === 'railpack') {
+            $this->show_is_static = true;
+            if (! $this->is_static) {
+                $this->port = 3000;
+            }
+        } elseif ($this->build_pack === 'static') {
+            $this->show_is_static = false;
+            $this->is_static = false;
+            $this->port = 80;
+        } else {
+            $this->show_is_static = false;
+            $this->is_static = false;
+        }
+    }
+
+    public function instantSave()
+    {
+        if ($this->is_static) {
+            $this->port = 80;
+            $this->publish_directory = '/dist';
+        } else {
+            $this->port = 3000;
+            $this->publish_directory = null;
+        }
+    }
+
+    public function setPrivateKey($private_key_id)
+    {
+        $project = Project::ownedByCurrentTeam()->where('uuid', $this->parameters['project_uuid'])->firstOrFail();
+        $environment = $project->environments()->where('uuid', $this->parameters['environment_uuid'])->firstOrFail();
+        $this->authorize('create', [Application::class, $environment]);
+        $this->authorize('useTeamCredentials');
+
+        $privateKey = PrivateKey::ownedByCurrentTeam()->findOrFail($private_key_id);
+        $this->private_key_id = $privateKey->id;
+        $this->current_step = 'repository';
+    }
+
+    protected function applicationForDetection(): Application
+    {
+        $this->get_git_source();
+
+        return $this->unsavedApplicationForDetection(
+            $this->git_repository,
+            $this->branch ?? 'main',
+            $this->git_source instanceof GithubApp || $this->git_source instanceof GitlabApp || $this->git_source instanceof GiteaApp ? $this->git_source : null,
+            PrivateKey::ownedByCurrentTeam()->findOrFail($this->private_key_id),
+        );
+    }
+
+    public function submit()
+    {
+        $privateKey = PrivateKey::ownedByCurrentTeam()->findOrFail($this->private_key_id);
+
+        $this->base_directory = ValidationPatterns::normalizeDirectoryPath($this->base_directory);
+        $this->validate();
+        try {
+            $destination_uuid = $this->query['destination'] ?? null;
+            $destination = find_resource_destination_for_current_team($destination_uuid);
+            if (! $destination) {
+                throw new \Exception('Destination not found.');
+            }
+            $destination_class = $destination->getMorphClass();
+
+            $this->get_git_source();
+
+            // Note: git_repository has already been validated and transformed in get_git_source()
+            // It may now be in SSH format (git@host:repo.git) which is valid for deploy keys
+
+            $project = Project::ownedByCurrentTeam()->where('uuid', $this->parameters['project_uuid'])->firstOrFail();
+            $environment = $project->environments()->where('uuid', $this->parameters['environment_uuid'])->firstOrFail();
+            $this->authorize('create', [Application::class, $environment]);
+            $this->authorize('useTeamCredentials');
+            if ($this->git_source === 'other') {
+                $application_init = [
+                    'name' => generate_random_name(),
+                    'git_repository' => $this->git_repository,
+                    'git_branch' => $this->branch,
+                    'build_pack' => $this->build_pack,
+                    'ports_exposes' => $this->port,
+                    'publish_directory' => $this->publish_directory,
+                    'environment_id' => $environment->id,
+                    'destination_id' => $destination->id,
+                    'destination_type' => $destination_class,
+                    'private_key_id' => $privateKey->id,
+                    'base_directory' => $this->base_directory,
+                ];
+            } else {
+                $application_init = [
+                    'name' => generate_random_name(),
+                    'git_repository' => $this->git_repository,
+                    'git_branch' => $this->branch,
+                    'build_pack' => $this->build_pack,
+                    'ports_exposes' => $this->port,
+                    'publish_directory' => $this->publish_directory,
+                    'environment_id' => $environment->id,
+                    'destination_id' => $destination->id,
+                    'destination_type' => $destination_class,
+                    'private_key_id' => $privateKey->id,
+                    'source_id' => $this->git_source->id,
+                    'source_type' => $this->git_source->getMorphClass(),
+                    'base_directory' => $this->base_directory,
+                ];
+            }
+            if ($this->build_pack === 'dockerfile' || $this->build_pack === 'dockerimage') {
+                $application_init['health_check_enabled'] = false;
+            }
+            if ($this->build_pack === 'dockerfile' && $dockerfileLocation = $this->selectedDockerfileLocation()) {
+                $application_init['dockerfile_location'] = $dockerfileLocation;
+            }
+            if ($this->build_pack === 'dockercompose') {
+                $application_init['docker_compose_location'] = $this->docker_compose_location;
+            }
+            $application = new Application($application_init);
+            $application->save();
+            $application->settings->is_static = $this->is_static;
+            $application->settings->save();
+
+            $fqdn = generateUrl(server: $destination->server, random: $application->uuid);
+            $application->fqdn = $fqdn;
+            $application->name = generate_random_name($application->uuid);
+            $application->save();
+
+            $this->importDetectedEnvironmentVariables($application);
+
+            return redirect()->route('project.application.configuration', [
+                'application_uuid' => $application->uuid,
+                'environment_uuid' => $environment->uuid,
+                'project_uuid' => $project->uuid,
+            ]);
+        } catch (\Throwable $e) {
+            return handleError($e, $this);
+        }
+    }
+
+    private function get_git_source()
+    {
+        // Validate repository URL before parsing
+        $validator = validator(['repository_url' => $this->repository_url], [
+            'repository_url' => ['required', 'string', new ValidGitRepositoryUrl],
+        ]);
+
+        if ($validator->fails()) {
+            throw new \RuntimeException('Invalid repository URL: '.$validator->errors()->first('repository_url'));
+        }
+
+        if (($scp = parseScpStyleGitUrl($this->repository_url)) !== null) {
+            $this->git_host = $scp['host'];
+            $this->git_repository = $this->repository_url;
+            $this->git_source = 'other';
+
+            return;
+        }
+
+        // Keep ssh:// URLs as-is so a custom SSH port is preserved for deployments.
+        if (str_starts_with($this->repository_url, 'ssh://')) {
+            $this->git_host = parse_url($this->repository_url, PHP_URL_HOST);
+            $this->git_repository = $this->repository_url;
+            $this->git_source = 'other';
+
+            return;
+        }
+
+        $this->repository_url_parsed = Url::fromString($this->repository_url);
+        $this->git_host = $this->repository_url_parsed->getHost();
+        $this->git_repository = $this->repository_url_parsed->getSegment(1).'/'.$this->repository_url_parsed->getSegment(2);
+
+        if ($this->git_host === 'github.com') {
+            $this->git_source = GithubApp::query()->whereKey(0)->where('is_public', true)->first();
+
+            return;
+        }
+        if (str($this->repository_url)->startsWith('http')) {
+            $this->git_host = $this->repository_url_parsed->getHost();
+            $this->git_repository = $this->repository_url_parsed->getSegment(1).'/'.$this->repository_url_parsed->getSegment(2);
+            // Convert to SSH format for deploy key usage
+            $this->git_repository = Str::finish("git@$this->git_host:$this->git_repository", '.git');
+        } else {
+            // If it's already in SSH format, just use it as-is
+            $this->git_repository = $this->repository_url;
+        }
+        $this->git_source = 'other';
+    }
+}

@@ -1,0 +1,47 @@
+<?php
+
+namespace App\Notifications\Channels;
+
+use App\Models\User;
+use Exception;
+use Illuminate\Mail\Message;
+use Illuminate\Notifications\Notification;
+use Illuminate\Support\Facades\Mail;
+
+class TransactionalEmailChannel
+{
+    public function send(User $notifiable, Notification $notification): void
+    {
+        $settings = instanceSettings();
+        if (blank(enabled_email_provider($settings))) {
+            return;
+        }
+
+        // Check if notification has a custom recipient (for email changes)
+        $email = property_exists($notification, 'newEmail') && $notification->newEmail
+            ? $notification->newEmail
+            : $notifiable->email;
+
+        if (! $email) {
+            return;
+        }
+        $this->bootConfigs();
+        $mailMessage = $notification->toMail($notifiable);
+        Mail::send(
+            [],
+            [],
+            fn (Message $message) => mail_from_message($message, $settings)
+                ->to($email)
+                ->subject($mailMessage->subject)
+                ->html((string) $mailMessage->render())
+        );
+    }
+
+    private function bootConfigs(): void
+    {
+        $type = set_transanctional_email_settings();
+        if (blank($type)) {
+            throw new Exception('No email settings found.');
+        }
+    }
+}

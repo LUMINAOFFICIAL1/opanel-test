@@ -1,0 +1,352 @@
+<?php
+
+use App\Jobs\CheckTraefikVersionForServerJob;
+use App\Models\InstanceSettings;
+use App\Models\Server;
+use App\Models\Team;
+use App\Notifications\Server\TraefikVersionOutdated;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Artisan;
+use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Notification;
+use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Once;
+
+uses(RefreshDatabase::class);
+
+beforeEach(function () {
+    Notification::fake();
+    InstanceSettings::unguarded(function () {
+        InstanceSettings::updateOrCreate(['id' => 0], []);
+    });
+});
+
+it('detects servers table has detected_traefik_version column', function () {
+    expect(Schema::hasColumn('servers', 'detected_traefik_version'))->toBeTrue();
+});
+
+it('server model casts detected_traefik_version as string', function () {
+    $server = Server::factory()->make();
+
+    expect($server->getFillable())->toContain('detected_traefik_version');
+});
+
+it('notification settings have traefik_outdated fields', function () {
+    $team = Team::factory()->create();
+
+    // Check Email notification settings
+    expect($team->emailNotificationSettings)->toHaveKey('traefik_outdated_email_notifications');
+
+    // Check Discord notification settings
+    expect($team->discordNotificationSettings)->toHaveKey('traefik_outdated_discord_notifications');
+
+    // Check Telegram notification settings
+    expect($team->telegramNotificationSettings)->toHaveKey('traefik_outdated_telegram_notifications');
+    // Thread ids default to null, so check the loaded columns instead of isset().
+    expect($team->telegramNotificationSettings->getAttributes())->toHaveKey('telegram_notifications_traefik_outdated_thread_id');
+
+    // Check Slack notification settings
+    expect($team->slackNotificationSettings)->toHaveKey('traefik_outdated_slack_notifications');
+
+    // Check Pushover notification settings
+    expect($team->pushoverNotificationSettings)->toHaveKey('traefik_outdated_pushover_notifications');
+
+    // Check Webhook notification settings
+    expect($team->webhookNotificationSettings)->toHaveKey('traefik_outdated_webhook_notifications');
+});
+
+it('upstream.json contains traefik branches with patch versions', function () {
+    $versionsPath = base_path('upstream.json');
+    expect(File::exists($versionsPath))->toBeTrue();
+
+    $versions = json_decode(File::get($versionsPath), true);
+    expect($versions)->toHaveKey('traefik');
+
+    $traefikVersions = $versions['traefik'];
+    expect($traefikVersions)->toBeArray();
+
+    // Each branch should have format like "v3.6" => "3.6.0"
+    foreach ($traefikVersions as $branch => $version) {
+        expect($branch)->toMatch('/^v\d+\.\d+$/'); // e.g., "v3.6"
+        expect($version)->toMatch('/^\d+\.\d+\.\d+$/'); // e.g., "3.6.0"
+    }
+
+    // Track current supported branches so the checker can surface security patches
+    // (see https://github.com/coollabsio/coolify/issues/11025)
+    expect($traefikVersions)->toHaveKeys(['v3.7', 'v3.6', 'v2.11']);
+    expect(version_compare($traefikVersions['v3.7'], '3.7.8', '>='))->toBeTrue();
+    expect(version_compare($traefikVersions['v3.6'], '3.6.23', '>='))->toBeTrue();
+    expect(version_compare($traefikVersions['v2.11'], '2.11.52', '>='))->toBeTrue();
+
+    // Newest tracked branch should sort as the highest major.minor
+    $newestBranch = collect($traefikVersions)
+        ->keys()
+        ->map(fn (string $branch) => ltrim($branch, 'v'))
+        ->sort(SORT_NATURAL)
+        ->last();
+    expect($newestBranch)->toBe('3.7');
+});
+
+it('notification class accepts servers collection with outdated info', function () {
+    $team = Team::factory()->create();
+    $server1 = Server::factory()->make([
+        'name' => 'Server 1',
+        'team_id' => $team->id,
+        'detected_traefik_version' => 'v3.5.0',
+    ]);
+    $server1->outdatedInfo = [
+        'current' => '3.5.0',
+        'latest' => '3.5.6',
+        'type' => 'patch_update',
+    ];
+
+    $server2 = Server::factory()->make([
+        'name' => 'Server 2',
+        'team_id' => $team->id,
+        'detected_traefik_version' => 'v3.4.0',
+    ]);
+    $server2->outdatedInfo = [
+        'current' => '3.4.0',
+        'latest' => '3.6.0',
+        'type' => 'minor_upgrade',
+    ];
+
+    $servers = collect([$server1, $server2]);
+
+    $notification = new TraefikVersionOutdated($servers);
+
+    expect($notification->servers)->toHaveCount(2);
+    expect($notification->servers->first()->outdatedInfo['type'])->toBe('patch_update');
+    expect($notification->servers->last()->outdatedInfo['type'])->toBe('minor_upgrade');
+});
+
+it('notification channels can be retrieved', function () {
+    $team = Team::factory()->create();
+
+    $notification = new TraefikVersionOutdated(collect());
+    $channels = $notification->via($team);
+
+    expect($channels)->toBeArray();
+});
+
+it('traefik version check command exists', function () {
+    $commands = Artisan::all();
+
+    expect($commands)->toHaveKey('traefik:check-version');
+});
+
+it('job handles servers with no proxy type', function () {
+    $team = Team::factory()->create();
+    $server = Server::factory()->create([
+        'team_id' => $team->id,
+    ]);
+
+    // Server without proxy configuration returns null for proxyType()
+    expect($server->proxyType())->toBeNull();
+});
+
+it('sends immediate notifications when outdated traefik is detected', function () {
+    // Notifications are now sent immediately from CheckTraefikVersionForServerJob
+    // when outdated Traefik is detected, rather than being aggregated and delayed
+    $team = Team::factory()->create();
+    $server = Server::factory()->make([
+        'name' => 'Server 1',
+        'team_id' => $team->id,
+    ]);
+
+    $server->outdatedInfo = [
+        'current' => '3.5.0',
+        'latest' => '3.5.6',
+        'type' => 'patch_update',
+    ];
+
+    // Each server triggers its own notification immediately
+    $notification = new TraefikVersionOutdated(collect([$server]));
+
+    expect($notification->servers)->toHaveCount(1);
+    expect($notification->servers->first()->outdatedInfo['type'])->toBe('patch_update');
+});
+
+it('notifies about a Traefik patch update', function () {
+    $team = Team::factory()->create();
+    $team->webhookNotificationSettings()->update([
+        'webhook_enabled' => true,
+        'webhook_url' => 'https://example.com/webhook',
+    ]);
+    $server = Server::factory()->create(['team_id' => $team->id]);
+
+    $job = new CheckTraefikVersionForServerJob($server, ['v3.7' => '3.7.13']);
+    (new ReflectionMethod($job, 'storeOutdatedInfo'))->invoke($job, '3.7.7', '3.7.13', 'patch_update');
+
+    Notification::assertSentTo($team, TraefikVersionOutdated::class);
+});
+
+it('does not repeat a Traefik patch update notification for the same latest version', function () {
+    $team = Team::factory()->create();
+    $team->webhookNotificationSettings()->update([
+        'webhook_enabled' => true,
+        'webhook_url' => 'https://example.com/webhook',
+    ]);
+    $server = Server::factory()->create([
+        'team_id' => $team->id,
+        'traefik_outdated_info' => [
+            'current' => '3.7.7',
+            'latest' => '3.7.13',
+            'type' => 'patch_update',
+        ],
+    ]);
+
+    $job = new CheckTraefikVersionForServerJob($server, ['v3.7' => '3.7.13']);
+    (new ReflectionMethod($job, 'storeOutdatedInfo'))->invoke($job, '3.7.7', '3.7.13', 'patch_update');
+
+    Notification::assertNothingSent();
+});
+
+it('notifies again when a newer Traefik patch version is released', function () {
+    $team = Team::factory()->create();
+    $team->webhookNotificationSettings()->update([
+        'webhook_enabled' => true,
+        'webhook_url' => 'https://example.com/webhook',
+    ]);
+    $server = Server::factory()->create([
+        'team_id' => $team->id,
+        'traefik_outdated_info' => [
+            'current' => '3.7.7',
+            'latest' => '3.7.13',
+            'type' => 'patch_update',
+        ],
+    ]);
+
+    $job = new CheckTraefikVersionForServerJob($server, ['v3.7' => '3.7.16']);
+    (new ReflectionMethod($job, 'storeOutdatedInfo'))->invoke($job, '3.7.7', '3.7.16', 'patch_update');
+
+    Notification::assertSentTo($team, TraefikVersionOutdated::class);
+});
+
+it('notifies about Traefik minor updates', function () {
+    $team = Team::factory()->create();
+    $team->webhookNotificationSettings()->update([
+        'webhook_enabled' => true,
+        'webhook_url' => 'https://example.com/webhook',
+    ]);
+    $server = Server::factory()->create(['team_id' => $team->id]);
+
+    $job = new CheckTraefikVersionForServerJob($server, ['v3.7' => '3.7.13']);
+    (new ReflectionMethod($job, 'storeOutdatedInfo'))->invoke($job, '3.6.20', '3.7.13', 'minor_upgrade', 'v3.7');
+
+    Notification::assertCount(1);
+});
+
+it('does not repeat a Traefik minor update notification when the target is unchanged', function () {
+    $team = Team::factory()->create();
+    $team->webhookNotificationSettings()->update([
+        'webhook_enabled' => true,
+        'webhook_url' => 'https://example.com/webhook',
+    ]);
+    $server = Server::factory()->create([
+        'team_id' => $team->id,
+        'traefik_outdated_info' => [
+            'current' => '3.6.20',
+            'latest' => '3.7.13',
+            'type' => 'minor_upgrade',
+            'upgrade_target' => 'v3.7',
+        ],
+    ]);
+
+    $job = new CheckTraefikVersionForServerJob($server, ['v3.7' => '3.7.13']);
+    (new ReflectionMethod($job, 'storeOutdatedInfo'))->invoke($job, '3.6.20', '3.7.13', 'minor_upgrade', 'v3.7');
+
+    Notification::assertNothingSent();
+});
+
+it('notification generates correct server proxy URLs', function () {
+    $team = Team::factory()->create();
+    $server = Server::factory()->create([
+        'name' => 'Test Server',
+        'team_id' => $team->id,
+        'uuid' => 'test-uuid-123',
+    ]);
+
+    $server->outdatedInfo = [
+        'current' => '3.5.0',
+        'latest' => '3.5.6',
+        'type' => 'patch_update',
+    ];
+
+    $notification = new TraefikVersionOutdated(collect([$server]));
+    $mail = $notification->toMail($team);
+
+    // Verify the mail has the transformed servers with URLs
+    expect($mail->viewData['servers'])->toHaveCount(1);
+    expect($mail->viewData['servers'][0]['name'])->toBe('Test Server');
+    expect($mail->viewData['servers'][0]['uuid'])->toBe('test-uuid-123');
+    expect($mail->viewData['servers'][0]['url'])->toBe(base_url().'/server/test-uuid-123/proxy');
+    expect($mail->viewData['servers'][0]['outdatedInfo'])->toBeArray();
+});
+
+it('notification transforms multiple servers with URLs correctly', function () {
+    $team = Team::factory()->create();
+    $server1 = Server::factory()->create([
+        'name' => 'Server 1',
+        'team_id' => $team->id,
+        'uuid' => 'uuid-1',
+    ]);
+    $server1->outdatedInfo = [
+        'current' => '3.5.0',
+        'latest' => '3.5.6',
+        'type' => 'patch_update',
+    ];
+
+    $server2 = Server::factory()->create([
+        'name' => 'Server 2',
+        'team_id' => $team->id,
+        'uuid' => 'uuid-2',
+    ]);
+    $server2->outdatedInfo = [
+        'current' => '3.4.0',
+        'latest' => '3.6.0',
+        'type' => 'minor_upgrade',
+        'upgrade_target' => 'v3.6',
+    ];
+
+    $servers = collect([$server1, $server2]);
+    $notification = new TraefikVersionOutdated($servers);
+    $mail = $notification->toMail($team);
+
+    // Verify both servers have URLs
+    expect($mail->viewData['servers'])->toHaveCount(2);
+
+    expect($mail->viewData['servers'][0]['name'])->toBe('Server 1');
+    expect($mail->viewData['servers'][0]['url'])->toBe(base_url().'/server/uuid-1/proxy');
+
+    expect($mail->viewData['servers'][1]['name'])->toBe('Server 2');
+    expect($mail->viewData['servers'][1]['url'])->toBe(base_url().'/server/uuid-2/proxy');
+});
+
+it('notification uses base_url helper not config app.url', function () {
+    config(['app.url' => 'http://localhost']);
+    InstanceSettings::query()->whereKey(0)->update(['fqdn' => 'https://coolify.example.com']);
+    Once::flush();
+
+    $team = Team::factory()->create();
+    $server = Server::factory()->create([
+        'name' => 'Test Server',
+        'team_id' => $team->id,
+        'uuid' => 'test-uuid',
+    ]);
+
+    $server->outdatedInfo = [
+        'current' => '3.5.0',
+        'latest' => '3.5.6',
+        'type' => 'patch_update',
+    ];
+
+    $notification = new TraefikVersionOutdated(collect([$server]));
+    $mail = $notification->toMail($team);
+
+    // Verify URL starts with base_url() not config('app.url')
+    $generatedUrl = $mail->viewData['servers'][0]['url'];
+    expect($generatedUrl)->toStartWith(base_url());
+    expect($generatedUrl)->toBe('https://coolify.example.com/server/test-uuid/proxy');
+    expect($generatedUrl)->not->toContain('localhost');
+});

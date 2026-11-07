@@ -1,0 +1,176 @@
+<?php
+
+namespace App\Actions\Server;
+
+use App\Helpers\SslHelper;
+use App\Models\Server;
+use App\Models\StandaloneDocker;
+use Lorisleiva\Actions\Concerns\AsAction;
+
+class InstallDocker
+{
+    use AsAction;
+
+    public function handle(Server $server)
+    {
+        $supported_os_type = $server->validateOS();
+        if (! $supported_os_type) {
+            throw new \Exception('Server OS type is not supported for automated installation. Please install Docker manually before continuing: <a target="_blank" class="underline" href="https://coolify.io/docs/installation#manually">documentation</a>.');
+        }
+
+        if (! $server->sslCertificates()->where('is_ca_certificate', true)->exists()) {
+            $serverCert = SslHelper::generateSslCertificate(
+                commonName: 'Coolify CA Certificate',
+                serverId: $server->id,
+                isCaCertificate: true,
+                validityDays: 10 * 365
+            );
+            $commands = SslHelper::caCertificateFileCommands($serverCert->ssl_certificate);
+            remote_process($commands, $server);
+        }
+
+        $config = base64_encode('{
+            "log-driver": "json-file",
+            "log-opts": {
+              "max-size": "10m",
+              "max-file": "3"
+            }
+          }');
+        $found = StandaloneDocker::where('server_id', $server->id);
+        if ($found->count() == 0 && $server->id) {
+            StandaloneDocker::create([
+                'name' => 'coolify',
+                'network' => 'coolify',
+                'server_id' => $server->id,
+            ]);
+        }
+        $command = collect([]);
+        if (isDev() && $server->id === 0) {
+            $command = $command->merge([
+                "echo 'Installing Docker Engine...'",
+                "echo 'Configuring Docker Engine (merging existing configuration with the required)...'",
+                'sleep 4',
+                "echo 'Restarting Docker Engine...'",
+                'ls -l /tmp',
+            ]);
+
+            return remote_process($command, $server);
+        } else {
+            $command = $command->merge([
+                "echo 'Installing Docker Engine...'",
+            ]);
+
+            if ($supported_os_type->contains('debian')) {
+                $command = $command->merge([$this->getDebianDockerInstallCommand()]);
+            } elseif ($supported_os_type->contains('rhel')) {
+                $command = $command->merge([$this->getRhelDockerInstallCommand()]);
+            } elseif ($supported_os_type->contains('sles')) {
+                $command = $command->merge([$this->getSuseDockerInstallCommand()]);
+            } elseif ($supported_os_type->contains('arch')) {
+                $command = $command->merge([$this->getArchDockerInstallCommand()]);
+            } elseif ($supported_os_type->contains('alpine')) {
+                $command = $command->merge([$this->getAlpineDockerInstallCommand()]);
+            } else {
+                $command = $command->merge([$this->getGenericDockerInstallCommand()]);
+            }
+
+            $command = $command->merge([
+                "echo 'Configuring Docker Engine (merging existing configuration with the required)...'",
+                'test -s /etc/docker/daemon.json && cp /etc/docker/daemon.json "/etc/docker/daemon.json.original-$(date +"%Y%m%d-%H%M%S")"',
+                "test ! -s /etc/docker/daemon.json && echo '{$config}' | base64 -d | tee /etc/docker/daemon.json > /dev/null",
+                "echo '{$config}' | base64 -d | tee /etc/docker/daemon.json.coolify > /dev/null",
+                'jq . /etc/docker/daemon.json.coolify | tee /etc/docker/daemon.json.coolify.pretty > /dev/null',
+                'mv /etc/docker/daemon.json.coolify.pretty /etc/docker/daemon.json.coolify',
+                "jq -s '.[0] * .[1]' /etc/docker/daemon.json.coolify /etc/docker/daemon.json | tee /etc/docker/daemon.json.appended > /dev/null",
+                'mv /etc/docker/daemon.json.appended /etc/docker/daemon.json',
+                "echo 'Restarting Docker Engine...'",
+            ]);
+            $command = $command->merge($this->getDockerServiceCommands($supported_os_type->contains('alpine')));
+            if ($server->isSwarm()) {
+                $command = $command->merge([
+                    'docker network create --attachable --driver overlay coolify-overlay >/dev/null 2>&1 || true',
+                ]);
+            } else {
+                $command = $command->merge([
+                    'docker network create --attachable coolify >/dev/null 2>&1 || true',
+                ]);
+                $command = $command->merge([
+                    "echo 'Done!'",
+                ]);
+            }
+
+            return remote_process($command, $server);
+        }
+    }
+
+    private function getDebianDockerInstallCommand(): string
+    {
+        return 'curl -fsSL https://get.docker.com | sh || ('.
+            '. /etc/os-release && '.
+            'DOCKER_CODENAME="${UBUNTU_CODENAME:-$VERSION_CODENAME}" && '.
+            // Docker has no repository for Ubuntu derivatives (Pop!_OS, Linux Mint) and none for Raspbian Trixie.
+            'case "$ID:$DOCKER_CODENAME: $ID_LIKE " in raspbian:trixie:*) DOCKER_REPO=debian ;; *" ubuntu "*) DOCKER_REPO=ubuntu ;; *) DOCKER_REPO=$ID ;; esac && '.
+            'install -m 0755 -d /etc/apt/keyrings && '.
+            'curl -fsSL https://download.docker.com/linux/${DOCKER_REPO}/gpg -o /etc/apt/keyrings/docker.asc && '.
+            'chmod a+r /etc/apt/keyrings/docker.asc && '.
+            'echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/${DOCKER_REPO} ${DOCKER_CODENAME} stable" > /etc/apt/sources.list.d/docker.list && '.
+            'apt-get update && '.
+            'apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin'.
+            ')';
+    }
+
+    private function getRhelDockerInstallCommand(): string
+    {
+        return 'curl -fsSL https://get.docker.com | sh || ('.
+            'dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo && '.
+            'dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin && '.
+            'systemctl start docker && '.
+            'systemctl enable docker'.
+            ')';
+    }
+
+    private function getSuseDockerInstallCommand(): string
+    {
+        return 'curl -fsSL https://get.docker.com | sh || ('.
+            'zypper addrepo https://download.docker.com/linux/sles/docker-ce.repo && '.
+            'zypper refresh && '.
+            'zypper install -y --no-confirm docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin && '.
+            'systemctl start docker && '.
+            'systemctl enable docker'.
+            ')';
+    }
+
+    private function getArchDockerInstallCommand(): string
+    {
+        return 'pacman -Syu --noconfirm --needed docker docker-compose && '.
+            'systemctl enable docker.service && '.
+            'systemctl start docker.service';
+    }
+
+    private function getAlpineDockerInstallCommand(): string
+    {
+        return 'apk update && '.
+            'apk add docker docker-cli-buildx docker-cli-compose && '.
+            'mkdir -p /etc/docker';
+    }
+
+    private function getDockerServiceCommands(bool $usesOpenRc): array
+    {
+        if ($usesOpenRc) {
+            return [
+                'rc-update add docker default',
+                'rc-service docker restart',
+            ];
+        }
+
+        return [
+            'systemctl enable docker >/dev/null 2>&1 || true',
+            'systemctl restart docker',
+        ];
+    }
+
+    private function getGenericDockerInstallCommand(): string
+    {
+        return 'curl -fsSL https://get.docker.com | sh';
+    }
+}

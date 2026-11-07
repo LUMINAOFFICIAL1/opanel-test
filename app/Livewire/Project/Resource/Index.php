@@ -1,0 +1,237 @@
+<?php
+
+namespace App\Livewire\Project\Resource;
+
+use App\Livewire\Concerns\RemembersCanvasView;
+use App\Models\Environment;
+use App\Models\Project;
+use App\Services\ImageScan\ResourceScans;
+use App\Services\ImageScan\VulnerabilityMarkers;
+use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\Blade;
+use Livewire\Component;
+
+class Index extends Component
+{
+    use RemembersCanvasView;
+
+    public Project $project;
+
+    public Environment $environment;
+
+    public Collection $allProjects;
+
+    public Collection $allEnvironments;
+
+    public array $parameters;
+
+    protected Collection $applications;
+
+    protected Collection $postgresqls;
+
+    protected Collection $redis;
+
+    protected Collection $mongodbs;
+
+    protected Collection $mysqls;
+
+    protected Collection $mariadbs;
+
+    protected Collection $keydbs;
+
+    protected Collection $dragonflies;
+
+    protected Collection $clickhouses;
+
+    protected Collection $sqlites;
+
+    protected Collection $services;
+
+    /** @var array<string, array{status: string, text: string, label: string, tooltip: ?string}> */
+    private array $markers = [];
+
+    public function mount(): void
+    {
+        $this->applications = $this->postgresqls = $this->redis = $this->mongodbs = $this->mysqls = $this->mariadbs = $this->keydbs = $this->dragonflies = $this->clickhouses = $this->sqlites = $this->services = collect();
+        $this->parameters = get_route_parameters();
+        $project = currentTeam()
+            ->projects()
+            ->select('id', 'uuid', 'team_id', 'name')
+            ->where('uuid', request()->route('project_uuid'))
+            ->firstOrFail();
+        $environment = $project->environments()
+            ->select('id', 'uuid', 'name', 'project_id')
+            ->where('uuid', request()->route('environment_uuid'))
+            ->firstOrFail();
+
+        if ($this->prefersCanvasView('environment')) {
+            $this->redirectRoute('project.environment.canvas', ['project_uuid' => $project->uuid, 'environment_uuid' => $environment->uuid], navigate: true);
+
+            return;
+        }
+
+        $this->project = $project;
+
+        // Load projects and environments for breadcrumb navigation
+        $this->allProjects = Project::ownedByCurrentTeamCached();
+        $environmentRelations = [
+            'applications:id,uuid,name,environment_id',
+            'services:id,uuid,name,environment_id',
+            'postgresqls:id,uuid,name,environment_id',
+            'redis:id,uuid,name,environment_id',
+            'mongodbs:id,uuid,name,environment_id',
+            'mysqls:id,uuid,name,environment_id',
+            'mariadbs:id,uuid,name,environment_id',
+            'keydbs:id,uuid,name,environment_id',
+            'dragonflies:id,uuid,name,environment_id',
+            'clickhouses:id,uuid,name,environment_id',
+            'sqlites:id,uuid,name,environment_id',
+        ];
+
+        $this->allEnvironments = $project->environments()
+            ->select('id', 'uuid', 'name', 'project_id')
+            ->with($environmentRelations)
+            ->get();
+
+        $this->environment = $environment->loadCount([
+            'applications',
+            'redis',
+            'postgresqls',
+            'mysqls',
+            'keydbs',
+            'dragonflies',
+            'clickhouses',
+            'mariadbs',
+            'mongodbs',
+            'sqlites',
+            'services',
+        ]);
+
+        // Eager load relationships for applications
+        $this->applications = $this->environment->applications()->with([
+            'tags',
+            'destination.server.settings',
+            'settings',
+        ])->get()->sortBy('name');
+        $projectUuid = $this->project->uuid;
+        $environmentUuid = $this->environment->uuid;
+        $this->applications = $this->applications->map(function ($application) use ($projectUuid, $environmentUuid) {
+            $application->hrefLink = route('project.application.configuration', [
+                'project_uuid' => $projectUuid,
+                'environment_uuid' => $environmentUuid,
+                'application_uuid' => $application->uuid,
+            ]);
+
+            return $application;
+        });
+        $this->applications = $this->applications->sortBy('name');
+
+        // Load all database resources in a single query per type
+        $databaseTypes = [
+            'postgresqls' => 'postgresqls',
+            'redis' => 'redis',
+            'mongodbs' => 'mongodbs',
+            'mysqls' => 'mysqls',
+            'mariadbs' => 'mariadbs',
+            'keydbs' => 'keydbs',
+            'dragonflies' => 'dragonflies',
+            'clickhouses' => 'clickhouses',
+            'sqlites' => 'sqlites',
+        ];
+
+        foreach ($databaseTypes as $property => $relation) {
+            $this->{$property} = $this->environment->{$relation}()->with([
+                'tags',
+                'destination.server.settings',
+            ])->get()->sortBy('name');
+            $this->{$property} = $this->{$property}->map(function ($db) use ($projectUuid, $environmentUuid) {
+                $db->hrefLink = route('project.database.configuration', [
+                    'project_uuid' => $projectUuid,
+                    'database_uuid' => $db->uuid,
+                    'environment_uuid' => $environmentUuid,
+                ]);
+
+                return $db;
+            });
+        }
+
+        // Load services with their tags and server
+        $this->services = $this->environment->services()->with([
+            'tags',
+            'destination.server.settings',
+        ])->get()->sortBy('name');
+        $this->services = $this->services->map(function ($service) use ($projectUuid, $environmentUuid) {
+            $service->hrefLink = route('project.service.configuration', [
+                'project_uuid' => $projectUuid,
+                'environment_uuid' => $environmentUuid,
+                'service_uuid' => $service->uuid,
+            ]);
+
+            return $service;
+        });
+    }
+
+    public function render()
+    {
+        $this->markers = VulnerabilityMarkers::for(collect([
+            $this->applications, $this->postgresqls, $this->redis, $this->mongodbs, $this->mysqls, $this->mariadbs,
+            $this->keydbs, $this->dragonflies, $this->clickhouses, $this->sqlites, $this->services,
+        ])->flatten(1));
+
+        return view('livewire.project.resource.index', [
+            'applications' => $this->applications,
+            'postgresqls' => $this->postgresqls,
+            'redis' => $this->redis,
+            'mongodbs' => $this->mongodbs,
+            'mysqls' => $this->mysqls,
+            'mariadbs' => $this->mariadbs,
+            'keydbs' => $this->keydbs,
+            'dragonflies' => $this->dragonflies,
+            'clickhouses' => $this->clickhouses,
+            'sqlites' => $this->sqlites,
+            'services' => $this->services,
+            'applicationsJs' => $this->toSearchableArray($this->applications, 'application', 'Application'),
+            'postgresqlsJs' => $this->toSearchableArray($this->postgresqls, 'database', 'Database'),
+            'redisJs' => $this->toSearchableArray($this->redis, 'database', 'Database'),
+            'mongodbsJs' => $this->toSearchableArray($this->mongodbs, 'database', 'Database'),
+            'mysqlsJs' => $this->toSearchableArray($this->mysqls, 'database', 'Database'),
+            'mariadbsJs' => $this->toSearchableArray($this->mariadbs, 'database', 'Database'),
+            'keydbsJs' => $this->toSearchableArray($this->keydbs, 'database', 'Database'),
+            'dragonfliesJs' => $this->toSearchableArray($this->dragonflies, 'database', 'Database'),
+            'clickhousesJs' => $this->toSearchableArray($this->clickhouses, 'database', 'Database'),
+            'sqlitesJs' => $this->toSearchableArray($this->sqlites, 'database', 'Database'),
+            'servicesJs' => $this->toSearchableArray($this->services, 'service', 'Service'),
+        ]);
+    }
+
+    private function toSearchableArray(Collection $items, string $type, string $typeLabel): array
+    {
+        return $items->map(fn ($item) => [
+            'uuid' => $item->uuid,
+            'name' => $item->name,
+            'type' => $type,
+            'typeLabel' => $typeLabel,
+            'fqdn' => $item->fqdn ?? null,
+            'description' => $item->description ?? null,
+            'status' => $item->status ?? '',
+            'restartLimitReached' => method_exists($item, 'stoppedAfterRestartLimit') && $item->stoppedAfterRestartLimit(),
+            'restartCount' => method_exists($item, 'stoppedAfterRestartLimit') && $item->stoppedAfterRestartLimit()
+                ? max($item->restart_count ?? 0, $item->max_restart_count ?? 0)
+                : ($item->restart_count ?? 0),
+            'maxRestartCount' => $item->max_restart_count ?? 0,
+            'server_status' => $item->server_status ?? null,
+            'hrefLink' => $item->hrefLink ?? '',
+            'logoHtml' => Blade::render('<x-resource-logo :resource="$resource" />', ['resource' => $item]),
+            'destination' => [
+                'server' => [
+                    'name' => $item->destination?->server?->name ?? 'Unknown',
+                ],
+            ],
+            'tags' => $item->tags->map(fn ($tag) => [
+                'id' => $tag->id,
+                'name' => $tag->name,
+            ])->values()->toArray(),
+            'security' => $this->markers[ResourceScans::key($item)] ?? null,
+        ])->values()->toArray();
+    }
+}

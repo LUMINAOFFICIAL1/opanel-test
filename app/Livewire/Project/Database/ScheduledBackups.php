@@ -1,0 +1,88 @@
+<?php
+
+namespace App\Livewire\Project\Database;
+
+use App\Models\ServiceDatabase;
+use App\Traits\ListensToTeamChannel;
+use Illuminate\Contracts\View\View;
+use Illuminate\Foundation\Auth\Access\AuthorizesRequests;
+use Livewire\Component;
+
+class ScheduledBackups extends Component
+{
+    use AuthorizesRequests;
+    use ListensToTeamChannel;
+
+    public $database;
+
+    public $parameters;
+
+    public $type;
+
+    public string $custom_type = 'mysql';
+
+    public function getListeners(): array
+    {
+        return [
+            'refreshScheduledBackups',
+            ...$this->teamChannelListeners(['BackupCreated' => '$refresh']),
+        ];
+    }
+
+    public function mount(): void
+    {
+        $this->parameters = get_route_parameters();
+        if ($this->database->getMorphClass() === ServiceDatabase::class) {
+            $this->type = 'service-database';
+        } else {
+            $this->type = 'database';
+        }
+    }
+
+    public function setCustomType()
+    {
+        try {
+            $this->authorize('update', $this->database);
+
+            $this->database->custom_type = $this->custom_type;
+            $this->database->save();
+            $this->dispatch('success', 'Database type set.');
+            $this->refreshScheduledBackups();
+        } catch (\Throwable $e) {
+            handleError($e, $this);
+        }
+    }
+
+    public function delete($scheduled_backup_id): void
+    {
+        try {
+            $this->authorize('delete', $this->database);
+
+            $backup = $this->database->scheduledBackups->find($scheduled_backup_id);
+            $backup->delete();
+            auditLog('ui.database.backup_schedule_deleted', [
+                'team_id' => $this->database->team()?->id,
+                'database_uuid' => $this->database->uuid,
+                'database_name' => $this->database->name,
+                'backup_uuid' => $backup->uuid,
+            ]);
+            $this->dispatch('success', 'Scheduled backup deleted.');
+            $this->refreshScheduledBackups();
+        } catch (\Throwable $e) {
+            handleError($e, $this);
+        }
+    }
+
+    public function refreshScheduledBackups(?int $id = null): void
+    {
+        $this->database->refresh();
+        $this->dispatch('refreshScheduledBackups');
+    }
+
+    public function render(): View
+    {
+        $this->database->loadMissing(['scheduledBackups.s3', 'scheduledBackups.s3Storages']);
+
+        return view('livewire.project.database.scheduled-backups');
+    }
+}
